@@ -1,0 +1,23 @@
+examples/background-task/pylock.toml
+  s_73dff590d463d8::t_e6629fa2c7baa9 1-19
+examples/chat/pylock.toml
+  s_73dff590d463d8::t_8c61160efc3911 1-19
+examples/counter/pylock.toml
+  s_73dff590d463d8::t_e7aeaf0b065d4d 1-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "543b1f0f800bda87265062dafb6aad60f66f6462",
+  "prompts": {},
+  "sessions": {
+    "s_73dff590d463d8": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f9d8f0515ffeUuuvfI118Uz5pl",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Viswa M <wishymovies@gmail.com>"
+    }
+  }
+}
