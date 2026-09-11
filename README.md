@@ -1,17 +1,12 @@
-# agents-py
+# Cloudflare Agents SDK for Python
 
-A server-side Python port of Cloudflare's Agents SDK, for Python Workers.
-
-An agent is a Durable Object with a WebSocket protocol on top: persistent state
-that syncs to every connected browser, methods the client can call directly, chat
-turns that survive a refresh, and durable execution that survives eviction.
-
-The one constraint that shapes everything: this speaks to the **unmodified
-TypeScript client**. `agents/react`, `useAgent`, `useAgentChat` and `agent.stub.*`
-all work against a Python Worker with no client changes, because the JSON wire
-format is reproduced exactly.
+This Python implementation of the Cloudflare Agents SDK lets you build stateful
+Agents in Python Workers and connect to them with the existing TypeScript and
+React clients. The examples below use `agents` 0.22.0 and
+`@cloudflare/ai-chat` 0.10.1.
 
 ```python
+# src/entry.py
 from agents import Agent, rpc_callable, route_agent_request
 from workers import Response, WorkerEntrypoint
 
@@ -21,99 +16,162 @@ class Counter(Agent):
         return {"count": 0}
 
     @rpc_callable()
-    def increment(self, n: int = 1):
+    def increment(self, amount: int = 1):
         state = self.state
-        state["count"] += n
+        state["count"] += amount
         self.set_state(state)
         return state["count"]
 
 
 class Default(WorkerEntrypoint):
     async def fetch(self, request):
-        return await route_agent_request(request, self.env, cors=True) or Response(
+        return await route_agent_request(request, self.env) or Response(
             "Not Found", status=404
         )
 ```
 
-`route_agent_request` returns `None` for a path that addresses no agent, so the
-rest of your Worker can handle it.
+Use the same Agent from a TypeScript client:
 
 ```tsx
-const agent = useAgent({ agent: "counter", name: "main" });
-await agent.stub.increment(5); // every connected client re-renders
+import { useState } from "react";
+import { useAgent } from "agents/react";
+
+type CounterState = { count: number };
+
+export function CounterButton() {
+  const [error, setError] = useState<string | null>(null);
+  const agent = useAgent<CounterState>({
+    agent: "Counter",
+    name: "main"
+  });
+
+  async function increment() {
+    try {
+      setError(null);
+      await agent.stub.increment(5);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Increment failed");
+    }
+  }
+
+  return (
+    <>
+      <button onClick={() => void increment()}>
+        Count: {agent.state?.count ?? 0}
+      </button>
+      {error && <p role="alert">{error}</p>}
+    </>
+  );
+}
 ```
 
-Note the name mapping: the class `Counter` is addressed as `counter`, and
-`DungeonMaster` as `dungeon-master`. The client derives the same kebab-case from
-the class name, so the two always agree.
-
-## Status
-
-Working today: HTTP and WebSocket routing with hibernation, the identity frame,
-bidirectional state sync, RPC including streaming, chat turns with persistence
-and resumable streaming, durable fibers with a recovery scan, cross-runtime schema
-versioning, sub-agents, awaited agent tools, and persistent scheduling through
-`Agent.schedule()` or the experimental `agents.schedules.Scheduler` capability.
-Facet schedules live in the root job queue while callbacks execute on their
-owning facet.
-
-Not implemented: task queues, MCP, workflows, detached agent tools,
-email, and observability. `design/PORT_TODO.md` tracks all of it feature by feature —
-check there before reaching for something.
+The `Counter` class is available at `/agents/counter/main`. Class names are
+converted to kebab-case on both sides, so `DungeonMaster` becomes
+`dungeon-master`.
 
 ## Install
 
-There is no PyPI release. Build the wheel and depend on it by path:
+Python Workers use a built wheel. From this repository, build it with Python
+3.12 and `uv`:
 
 ```bash
-cd agents-py && uv build
+uv build
 ```
 
+Add the wheel to the Worker project's `pyproject.toml`:
+
 ```toml
-# pyproject.toml
+[project]
+requires-python = ">=3.12"
 dependencies = [
-    "agents-py @ file:///abs/path/to/agents-py/dist/agents_py-0.1.0-py3-none-any.whl",
+    "agents-py @ file:///absolute/path/to/agents-py/dist/agents_py-0.1.0-py3-none-any.whl",
 ]
 ```
 
-Because it is a built wheel rather than an editable install, an edit to the SDK
-does not reach your Worker until you rebuild and clear the resolved environment:
+Install the Python Worker tooling and resolve the environment:
 
 ```bash
-uv build                            # in agents-py
-rm -rf .venv .venv-workers pylock.toml uv.lock   # in your Worker
+uv add --dev workers-py
+uv sync
 ```
 
-`pywrangler dev` does **not** hot-reload the vendored wheel. Restart it after a
-rebuild or you will be testing the old code.
+Install the browser client in the frontend project:
 
-## Configuration
+```bash
+npm install agents@0.22.0 react@19 react-dom@19
+```
+
+For chat applications, also install the AI Chat client:
+
+```bash
+npm install @cloudflare/ai-chat@0.10.1 @ai-sdk/react@3 ai@6 zod@4
+```
+
+## Configure
+
+Register each top-level Agent class as a SQLite Durable Object:
 
 ```jsonc
 {
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "python-agent",
   "main": "src/entry.py",
+  "compatibility_date": "2026-07-20",
   "compatibility_flags": ["python_workers"],
   "durable_objects": {
     "bindings": [{ "class_name": "Counter", "name": "COUNTER" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }]
+}
+```
+
+The binding name is the screaming-snake form of the class name: `Counter`
+becomes `COUNTER`, while `DungeonMaster` becomes `DUNGEON_MASTER`.
+
+If the Worker also serves a single-page application, route Agent requests to the
+Worker before the asset fallback:
+
+```jsonc
+{
   "assets": {
     "directory": "./frontend/build/client",
     "not_found_handling": "single-page-application",
-    // Without this, the SPA fallback answers the WebSocket upgrade with index.html.
     "run_worker_first": ["/agents/*"]
   }
 }
 ```
 
-Every agent class needs a binding and a `new_sqlite_classes` migration — except a
-sub-agent class, which needs neither.
+Without `run_worker_first`, the SPA can answer WebSocket upgrades and chat
+history requests with `index.html`.
+
+`route_agent_request()` performs routing, not authentication. For cross-origin
+HTTP, let credentialless `OPTIONS` requests reach the router with an explicit
+CORS header dictionary before authenticating other methods. For WebSocket
+upgrades, validate both credentials and `Origin` before routing. `cors=True`
+allows every HTTP origin and does not protect WebSocket upgrades.
+
+## Run and deploy
+
+Run these commands from the Worker project:
+
+```bash
+uv run pywrangler dev
+uv run pywrangler deploy
+```
+
+Agent instances are addressed as:
+
+```text
+/agents/{kebab-case-class-name}/{instance-name}
+```
+
+`route_agent_request()` returns `None` when a path does not address an Agent, so
+the rest of the Worker can handle that request.
 
 ## State
 
-`state` is a dict persisted to SQLite and mirrored to every connected client.
-`set_state` writes and broadcasts in one step; `initial_state` supplies the
-starting value on first use.
+Agent state is a JSON dictionary stored in the Durable Object's SQLite database
+and synchronized with every connected client.
 
 ```python
 class Room(Agent):
@@ -121,67 +179,269 @@ class Room(Agent):
         return {"players": [], "phase": "lobby"}
 
     @rpc_callable()
-    def join(self, who: str):
+    def join(self, player: str):
         state = self.state
-        state["players"] = [*state["players"], who]
+        state["players"] = [*state["players"], player]
         self.set_state(state)
+        return state
 ```
 
-Read-modify-write the whole dict as above. `self.state` hands back the stored
-value, so mutating it in place without calling `set_state` persists nothing and
-tells no one.
+Always call `set_state()` after changing state. Mutating the value returned by
+`self.state` does not persist or broadcast the update by itself. State values
+must be JSON-compatible dictionaries with finite numbers.
 
-A client's own `setState` is applied optimistically before it reaches the server,
-so the update is broadcast to everyone *except* its sender.
+A state update sent by a client is broadcast to the other clients. The sender
+already applied its update optimistically, so it does not receive an echo.
 
-## RPC
+## Callable methods
 
-`@rpc_callable()` exposes a method to `agent.stub.<name>()`. Arguments and return
-values cross as JSON. Sync and async methods both work.
+Decorate a method with `@rpc_callable()` to expose it through
+`agent.stub.<method>()`. Synchronous and asynchronous methods are supported, and
+arguments and return values cross the connection as JSON.
 
 ```python
 @rpc_callable()
-async def summarise(self, doc_id: str) -> str:
-    rows = self.sql("SELECT body FROM docs WHERE id = ?", doc_id)
+async def summarize(self, document_id: str) -> str:
+    rows = self.sql("SELECT body FROM documents WHERE id = ?", document_id)
+    if not rows:
+        return ""
     return rows[0]["body"][:200]
 ```
 
-For a long answer, take a stream and push to it. A streaming method receives a
-`StreamingResponse` as its first argument, before the client's own arguments:
+The decorator adds RPC metadata without replacing the method, so it remains a
+normal Python method when called from server code.
+
+### Streaming RPC
+
+A streaming RPC receives a `StreamingResponse` before the client's arguments:
 
 ```python
+from agents import StreamingResponse, rpc_callable
+
+
 @rpc_callable(streaming=True)
-async def tail(self, stream, n: int):
-    for row in self.sql("SELECT line FROM log LIMIT ?", n):
+async def tail(self, stream: StreamingResponse, limit: int):
+    limit = max(1, min(int(limit), 100))
+    for row in self.sql("SELECT line FROM logs ORDER BY id DESC LIMIT ?", limit):
         stream.send(row["line"])
     stream.end()
 ```
 
-The stream owns the call's terminal frame: `end()` (or `error()`) must be reached
-on every path, because the client's promise settles only when a terminal arrives.
-
-The decorator only attaches immutable discovery metadata. The method remains an
-ordinary Python method and can be called directly from your own code.
+Call `stream.end()` or `stream.error("reason")` on every handled path. The
+client's promise settles when it receives that terminal frame.
 
 ## SQL
 
-`self.sql(query, *params)` returns a list of dicts. Parameters are bound, never
-interpolated.
+Use `self.sql(query, *params)` for application data. It returns a list of
+dictionaries and binds parameters positionally.
 
 ```python
-self.sql("CREATE TABLE IF NOT EXISTS docs (id TEXT PRIMARY KEY, body TEXT)")
-self.sql("INSERT INTO docs VALUES (?, ?)", doc_id, body)
-rows = self.sql("SELECT body FROM docs WHERE id = ?", doc_id)
+class Documents(Agent):
+    async def on_start(self):
+        self.sql(
+            "CREATE TABLE IF NOT EXISTS documents ("
+            "id TEXT PRIMARY KEY, body TEXT NOT NULL)"
+        )
+
+    @rpc_callable()
+    def save(self, document_id: str, body: str):
+        self.sql(
+            "INSERT OR REPLACE INTO documents (id, body) VALUES (?, ?)",
+            document_id,
+            body,
+        )
 ```
 
-Tables prefixed `cf_agents_`, `cf_ai_chat_`, and `cf_agent_tool_` belong to the
-framework. Create your own in `on_start`.
+Create application tables in `on_start()`, which runs before the Agent serves
+requests. Keep `__init__()` limited to in-memory setup. Do not use table names
+beginning with `cf_agents_`, `cf_ai_chat_`, or `cf_agent_tool_`; those prefixes
+belong to the SDK.
 
-## Chat
+## Chat Agents
 
-`AIChatAgent` handles the chat protocol; you implement one method. Return a
-string, or yield to stream. Message history is persisted and available as
-`self.messages`.
+Subclass `AIChatAgent` and implement `on_chat_message()`. Return a string or
+yield strings to stream a response. Persisted conversation history is available
+as `self.messages`.
+
+```python
+from agents import AIChatAgent, ChatOptions
+
+
+class Assistant(AIChatAgent):
+    max_persisted_messages = 200
+
+    async def on_chat_message(self, options: ChatOptions):
+        if options.aborted:
+            return
+
+        yield "Hello"
+        yield " from Python."
+```
+
+`ChatOptions` provides `request_id`, `trigger`, `body`, `abort`, and `aborted`.
+Yielded strings become text deltas; yielded dictionaries pass through as raw UI
+message chunks for tools and custom parts.
+
+Connect with `useAgentChat`:
+
+```tsx
+import { useAgent } from "agents/react";
+import { useAgentChat } from "@cloudflare/ai-chat/react";
+
+function Chat() {
+  const agent = useAgent({ agent: "Assistant", name: "main" });
+  const {
+    messages,
+    sendMessage,
+    clearHistory,
+    status,
+    error,
+    connectionError
+  } = useAgentChat({ agent });
+
+  return (
+    <form
+      onSubmit={async (event) => {
+        event.preventDefault();
+        try {
+          await sendMessage({ text: "Hello" });
+        } catch (cause) {
+          console.error("Could not send message", cause);
+        }
+      }}
+    >
+      <button type="submit" disabled={status !== "ready"}>
+        Send
+      </button>
+      <button type="button" onClick={() => clearHistory()}>
+        Clear
+      </button>
+      <pre>{JSON.stringify(messages, null, 2)}</pre>
+      {(error || connectionError) && (
+        <p role="alert">{(error || connectionError)?.message}</p>
+      )}
+    </form>
+  );
+}
+```
+
+Chat chunks are stored before they are broadcast. If the connection drops while
+an answer is streaming, the client reconnects, replays the stored prefix, and
+continues with the live response without application code.
+
+## Scheduling
+
+Use the Scheduler for callbacks that must run at a particular time or interval.
+Decorated callbacks receive the stored payload and `Schedule` record.
+
+```python
+from agents import Agent, rpc_callable
+from agents.schedules import Schedule, scheduler_callback
+
+
+class Reminders(Agent):
+    @scheduler_callback()
+    async def deliver(self, payload: object, schedule: Schedule):
+        self.broadcast_json(
+            {
+                "type": "reminder",
+                "scheduleId": schedule.id,
+                "payload": payload,
+            }
+        )
+
+    @rpc_callable()
+    async def remind_in_one_minute(self, message: str) -> str:
+        schedule = await self.schedule(60, "deliver", {"message": message})
+        return schedule.id
+```
+
+The first argument to `schedule()` can be a delay in seconds, a `datetime`, or a
+cron expression. Naive datetimes are interpreted as UTC. Cron expressions use
+five or six fields and run in UTC. Use `schedule_every()` for recurring
+intervals:
+
+```python
+schedule = await self.schedule_every(300, "deliver", {"type": "heartbeat"})
+await self.cancel_schedule(schedule.id)
+```
+
+Other inspection methods are `get_schedule_by_id()` and `list_schedules()`.
+
+## Replayable Tasks
+
+Tasks persist each run and step so completed steps are reused when execution
+restarts. Put side effects behind `step.do()` and give every step a stable name.
+
+```python
+from agents import Agent, rpc_callable
+from agents.tasks import TaskStep, task_definition
+
+
+class Reports(Agent):
+    @task_definition()
+    async def build_report(self, input: dict[str, int], step: TaskStep):
+        @step.do("calculate")
+        async def calculate():
+            return input["value"] * 2
+
+        result = await calculate()
+        return {"result": result}
+
+    @rpc_callable()
+    async def start_report(self, job_id: str, value: int) -> str:
+        receipt = await self.tasks.run(
+            "build_report",
+            {"value": value},
+            idempotency_key=f"report:{job_id}",
+        )
+        return receipt.run_id
+```
+
+`tasks.run()` returns after durable acceptance. Inspect a run with
+`self.tasks.get(run_id)`, cancel it with `self.tasks.cancel(run_id)`, or list runs
+with `self.tasks.list()`.
+
+Steps can retry, time out, sleep, and expose an idempotency key for external
+operations:
+
+```python
+from agents.tasks import TaskStepAttempt, TaskStepConfig, TaskStepRetryOptions
+
+
+async def call_service(attempt: TaskStepAttempt):
+    attempt.signal.throw_if_aborted()
+    return {
+        "requestId": attempt.idempotency_key,
+        "status": "submitted",
+    }
+
+
+result = await step.do(
+    "call-service",
+    TaskStepConfig(
+        retries=TaskStepRetryOptions(
+            limit=3,
+            delay="1 second",
+            backoff="exponential",
+        ),
+        timeout="30 seconds",
+    ),
+    call_service,
+)
+
+await step.sleep("wait-for-indexing", "10 seconds")
+```
+
+Task inputs, metadata, step results, and final results must be strict JSON values.
+Use Tasks for replayable orchestration; use Scheduler when the primary concern is
+when a callback should run.
+
+## Sessions
+
+`AIChatAgent` installs `Sessions` automatically and uses the default session for
+its canonical message history. Named sessions are useful for side conversations,
+audit trails, and application-specific message trees.
 
 ```python
 from agents import AIChatAgent
@@ -189,231 +449,234 @@ from agents import AIChatAgent
 
 class Assistant(AIChatAgent):
     async def on_chat_message(self, options):
-        for message in history_from(self.messages):
-            if options.aborted:  # the user pressed stop
-                return
-            yield message
+        audit = self.sessions.session("audit")
+        await audit.append_message(
+            {
+                "id": options.request_id,
+                "role": "user",
+                "parts": [{"type": "text", "text": "Turn accepted"}],
+            }
+        )
+        return "Accepted"
 ```
 
-`options` carries `request_id`, `trigger`, the raw `body`, and `aborted`.
-Yielding a `str` becomes a text delta; yielding a dict is passed through as a raw
-UI message chunk, which is how tool calls are rendered. Set
-`max_persisted_messages` on the class to cap rows kept in SQLite.
-
-A client that drops mid-answer reconnects and picks the same turn back up — the
-chunks are buffered in SQLite, replayed on reconnect, then joined to the live
-stream. That works with no code from you.
-
-## Fibers
-
-A fiber is durable execution: checkpointed work that resumes after the Durable
-Object is evicted mid-flight.
+A session stores branches rather than only a flat list. Omitting `parent_id`
+appends to the latest leaf, `parent_id=None` starts a new root, and an explicit
+message ID creates a branch from that parent.
 
 ```python
-from agents import FiberRecoveryResult
-
-
-class Job(Agent):
-    @rpc_callable()
-    async def start(self):
-        result = await self.start_fiber(
-            "import", self._import, wait_for_completion=True
-        )
-        return result.fiber_id
-
-    async def _import(self, ctx):
-        for i, batch in enumerate(batches()):
-            await push(batch)
-            ctx.stash({"done": i})  # checkpoint
-
-    async def on_fiber_recovered(self, ctx):
-        done = (ctx.snapshot or {}).get("done", 0)
-        for i, batch in enumerate(batches()):
-            if i > done:
-                await push(batch)
-        return FiberRecoveryResult(status="completed")
+session = self.sessions.session("research")
+history = await session.get_history()
+latest = await session.get_latest_leaf()
+matches = await session.search("deployment notes")
+await session.delete_messages(["message-id"])
+await session.clear_messages()
 ```
 
-If the object dies mid-run, the next activation's recovery scan hands your last
-checkpoint to `on_fiber_recovered`, which resumes rather than restarting.
-`inspect_fiber`, `list_fibers`, `cancel_fiber` and `delete_fibers` read and drive
-the ledger. A recovery result must use one of `completed`, `error`, `aborted`, or
-`interrupted`; other values are rejected before they can corrupt the ledger.
+Use `history_batches()` for large histories, `search()` for message text, and
+`on_compaction()` with `compact()` to summarize older history while keeping the
+stored messages intact.
 
-Fibers currently run only on awaited paths, so pass
-`wait_for_completion=True` — a detached background fiber escapes the Durable
-Object's I/O context and is disabled by default pending deployed S1 evidence.
-The isolated runtime probe opts in through `detached_fibers_enabled`; application
-agents should not enable it until that probe passes for the deployed runtime.
+## Context
+
+`ContextBlocks` combines named context providers into a system prompt and can
+shape older messages without changing stored Session history.
+
+```python
+from agents import AIChatAgent
+from agents.context import AgentContextProvider, ContextBlocks, ContextConfig
+
+
+class Assistant(AIChatAgent):
+    async def on_start(self):
+        self.context = ContextBlocks(
+            [
+                ContextConfig(
+                    label="memory",
+                    description="Facts remembered about the user",
+                    max_tokens=1_000,
+                    provider=AgentContextProvider(self),
+                )
+            ],
+            prompt_store=AgentContextProvider(self, "system-prompt"),
+        )
+        await self.context.load()
+
+    async def on_chat_message(self, options):
+        model_input = await self.context.assemble(self.messages)
+        return await call_your_model(model_input)
+```
+
+Use `await self.context.set_block(...)` or
+`await self.context.append_to_block(...)` to update writable context. Use
+`AgentSearchProvider` for searchable key/value context, and
+`await self.context.tools()` to expose `set_context` and `search_context` tools
+based on provider capabilities.
+`assemble()` returns a system prompt and a shaped message list to pass to your
+model provider; it does not modify the stored Session history.
 
 ## Sub-agents
 
-An agent can spawn named children that run on its own machine, each with its own
-isolated SQLite. A child class needs **no binding and no migration** — it only has
-to be exported from the entry module.
+Sub-agents are named child Agents with isolated SQLite storage. The child class
+must be exported from the Worker entry module, but it does not need its own
+Durable Object binding or migration.
 
 ```python
+from agents import Agent, rpc_callable
+
+
+class ProjectItem(Agent):
+    async def on_start(self):
+        self.sql(
+            "CREATE TABLE IF NOT EXISTS metadata ("
+            "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+
+    def set_title(self, title: str):
+        self.sql(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('title', ?)",
+            title,
+        )
+        return title
+
+
 class Project(Agent):
     @rpc_callable()
-    async def add_task(self, name: str, title: str):
-        task = await self.sub_agent(Task, name)  # gets or creates
-        return await task.set_title(title)
-
-
-class Task(Agent):
-    def set_title(self, title: str):  # plain method, not @rpc_callable
-        self.sql("INSERT OR REPLACE INTO meta VALUES ('title', ?)", title)
-        return {"title": title}
+    async def add_item(self, name: str, title: str):
+        item = await self.sub_agent(ProjectItem, name)
+        return await item.set_title(title)
 ```
 
-Methods reached through a sub-agent stub remain ordinary callable methods.
-`@rpc_callable` attaches protocol metadata without replacing the function, so a
-method may be exposed to both a sub-agent stub and the Agent protocol.
+Only `Project` is added to `durable_objects.bindings` and
+`new_sqlite_classes`. Use `has_sub_agent()` and `list_sub_agents()` for
+inspection, `abort_sub_agent()` to stop a child while preserving storage, and
+`delete_sub_agent()` to destroy it.
 
-Children are reachable over HTTP by walking the path, one `/sub/{class}/{name}`
-hop per level:
+Only a top-level Agent can delete sub-agents. A child's `on_start()` must not
+call its waiting parent, because the parent is waiting for child startup to
+finish.
 
+Nested HTTP and WebSocket routes add one `/sub/{class}/{name}` hop per child:
+
+```text
+/agents/project/roadmap/sub/project-item/design/status
 ```
-/agents/project/roadmap/sub/task/design/status
-```
 
-`on_before_sub_agent(request, child)` gates each hop. Return `None` to forward, or
-a `Response` to answer without waking the child. It runs only in `fetch`, so it
-gates HTTP and not RPC, and each hop is checked by its own parent — a nested child
-needs the hook on the intermediate class too.
+Override `on_before_sub_agent()` to authorize each HTTP or WebSocket hop before
+the child wakes.
+
+## Agent Tools
+
+`run_agent_tool()` delegates an awaited unit of work to a chat-capable child
+Agent. A stable `run_id` makes retries join or repair the same durable execution.
 
 ```python
-async def on_before_sub_agent(self, request, child):
-    if not allowed(child["name"]):
-        return Response("Forbidden", status=403)
-    return None
-```
+from agents import AIChatAgent, Agent, rpc_callable
 
-Lifecycle: `abort_sub_agent` stops a child and keeps its storage;
-`await delete_sub_agent(...)` destroys it, transitively. `has_sub_agent` and
-`list_sub_agents` read the parent's registry, and `parent_agent(cls)` reaches back
-up one level.
 
-Two limits to design around:
-
-- **`delete_sub_agent` only works from the top-level agent.** The runtime refuses
-  to let a sub-agent destroy its own children. Use `abort_sub_agent` at depth, or
-  delete an ancestor — deletion is transitive.
-- **Child WebSockets are buffered through the root.** The root owns the physical
-  socket and forwards each event to the addressed child, including nested paths.
-  A handler must finish within 30 seconds and return at most 1,000 frames or 1 MiB
-  per event. Live cross-facet token delivery remains disabled pending deployed
-  runtime evidence. Buffered operations are collected only during the addressed
-  connection's current event, so broadcasts cannot reach an idle child socket.
-
-A child's `on_start` must not call back into its parent: the parent is awaiting the
-child's startup from inside `blockConcurrencyWhile`, so it deadlocks.
-
-## Agent tools
-
-`run_agent_tool` delegates one awaited task to a chat-capable child. The child
-class is the first argument; each `run_id` names its durable sub-agent, so retrying
-the same ID returns or repairs the same execution rather than running it twice.
-
-```python
 class ResearchAgent(AIChatAgent):
     async def on_chat_message(self, options):
         question = options.body["agentToolInput"]
-        return await research(question)
+        return f"Research result for: {question}"
 
 
 class Coordinator(Agent):
-    async def investigate(self, question: str):
+    @rpc_callable()
+    async def investigate(self, job_id: str, question: str):
         result = await self.run_agent_tool(
             ResearchAgent,
             input=question,
-            run_id=f"research:{stable_id(question)}",
-            parent_tool_call_id="tool-call-1",
+            run_id=f"research:{job_id}",
+            parent_tool_call_id=job_id,
         )
         if result.status != "completed":
             raise RuntimeError(result.error or result.status)
         return result.output
 ```
 
-The result mirrors the TypeScript SDK's awaited shape: `run_id`, `agent_type`,
-`status`, `output`, `summary`, `error`, `reason`, and `child_still_running`.
-`format_agent_tool_input`, `get_agent_tool_output`, and
-`get_agent_tool_summary` can be overridden on the child; by default the input is
-stored as a user message and the final assistant text becomes the output and
-summary.
+The child class must be exported, but it needs no binding or migration. Pass
+`input_preview=None` when the input should not be shown in parent connection
+events. Override `max_concurrent_agent_tools` on the parent to change the default
+concurrency limit of four.
 
-By default, a string input or serialized value is truncated to 500 characters
-and sent as `inputPreview` to every parent connection. Pass `input_preview=None`
-for sensitive inputs. `display` supplies optional UI metadata and
-`display_order` defaults to `0`. An `abort` event is checked before and after the
-awaited child RPC; reliable mid-flight cross-facet cancellation is not enabled.
+## Connections and lifecycle
 
-At most four agent tools run concurrently by default. Override
-`max_concurrent_agent_tools` on the parent to change that limit; rejection
-returns an `error` result rather than raising. Soft runs become repairable
-`interrupted` rows after `agent_tool_recovery_grace_ms`, which defaults to five
-minutes.
+Use lifecycle hooks to initialize resources and handle application traffic:
 
-The parent persists every `agent-tool-event` before broadcasting it and replays
-the same sequence on reconnect. The current implementation awaits the child's
-active RPC and then forwards its buffered chunks as one ordered batch. Live
-cross-facet tailing, mid-flight cancellation, progress milestones, and detached
-runs remain gated on deployed runtime probes.
+| Hook | Called when |
+| --- | --- |
+| `on_start()` | The Agent activation is ready for application setup |
+| `on_connect(connection, context)` | A WebSocket connection opens |
+| `on_message(connection, message)` | A frame is not claimed by the Agent protocol |
+| `on_close(connection, code, reason, was_clean)` | A connection closes |
+| `on_request(request)` | The Agent receives an ordinary HTTP request |
+| `on_error(error, connection=None)` | A hook or runtime operation fails |
+| `on_before_sub_agent(request, child)` | A request is about to enter a child Agent |
 
-## Durable chat recovery
+Hooks may be synchronous or asynchronous. Framework protocol handling and
+cleanup run before the public hook, so overrides do not need to call `super()`.
 
-Set `durable_chat_recovery = True` on an `AIChatAgent` to persist immutable turn
-context in a managed awaited fiber. If the object is evicted mid-turn, startup
-recovery folds a bounded prefix of stored stream chunks into a partial assistant
-message, emits the normal terminal frame, and cleans up the internal fiber. It
-never calls `on_chat_message` or the model during startup, so recovery cannot
-duplicate provider work. The feature is off by default; ordinary orphan streams
-still replay and settle without being added to message history.
-
-## Lifecycle hooks
-
-| Hook | When |
-|---|---|
-| `on_start` | Once per activation, before anything else is served |
-| `on_connect(connection, ctx)` | A client socket opened |
-| `on_message(connection, message)` | A frame the protocol did not claim |
-| `on_close(connection, code, reason, was_clean)` | A socket closed |
-| `on_request(request)` | A plain HTTP request to this agent |
-| `on_error(error, connection=None)` | Any hook or plumbing failure |
-| `on_before_sub_agent(request, child)` | A request is about to hop into a child |
-
-`on_start` is the place for schema setup. It runs inside the init barrier, so it
-completes before any request is served.
-
-Lifecycle hooks may be synchronous or asynchronous. Framework handshakes,
-internal routes, and cleanup run in protected dispatch methods before the public
-hook, so an override does not call `super()` to preserve SDK behavior. Methods
-whose names begin with `_dispatch_` are internal and should not be overridden.
-
-Broadcasting outside a state update:
+Broadcast an application frame to every open connection:
 
 ```python
-self.broadcast_json({"type": "toast", "text": "done"})  # optional exclude=[id]
+self.broadcast_json({"type": "notice", "text": "Build finished"})
 ```
 
-## Gotchas
+Use `get_connection(id)` and `get_connections(tag=None)` to inspect connections.
+Override `get_connection_tags()` to assign tags during connection setup.
 
-- **Nothing in `__init__` may raise.** The runtime re-runs the constructor on
-  every wake with no way in to repair, so a raise there bricks the object
-  permanently. Do setup in `on_start`.
-- **Restart `pywrangler dev` after rebuilding the wheel.** It will not pick up SDK
-  changes on its own.
-- **State must be a JSON object.** A scalar poisons every later read, including
-  the one in the connection handshake.
-- Deployed behaviour differs from local in one place that matters: `getWebSockets()`
-  returns `[]` under miniflare, so socket-recovery bugs are invisible until
-  deployed.
+## API map
 
-## Further reading
+| Goal | Import or API |
+| --- | --- |
+| [Define an Agent](#state) | `from agents import Agent` |
+| [Define a chat Agent](#chat-agents) | `from agents import AIChatAgent` |
+| [Route requests](#configure) | `route_agent_request(request, env, cors=...)` |
+| [Expose RPC](#callable-methods) | `@rpc_callable()` |
+| [Stream RPC results](#streaming-rpc) | `StreamingResponse` and `@rpc_callable(streaming=True)` |
+| [Read and update state](#state) | `self.state`, `self.set_state(...)` |
+| [Query SQLite](#sql) | `self.sql(query, *params)` |
+| [Schedule callbacks](#scheduling) | `agents.schedules`, `self.schedule(...)`, `self.scheduler` |
+| [Run replayable work](#replayable-tasks) | `agents.tasks`, `@task_definition()`, `self.tasks` |
+| [Store message trees](#sessions) | `agents.sessions`, `self.sessions` on `AIChatAgent` |
+| [Assemble model context](#context) | `agents.context.ContextBlocks` |
+| [Create child Agents](#sub-agents) | `self.sub_agent(...)` |
+| [Delegate to an Agent Tool](#agent-tools) | `self.run_agent_tool(...)` |
+| [Broadcast to clients](#connections-and-lifecycle) | `self.broadcast(...)`, `self.broadcast_json(...)` |
+| [Inspect connections](#connections-and-lifecycle) | `self.get_connection(...)`, `self.get_connections(...)` |
 
-- `design/PORT_TODO.md` — per-feature parity against the reference, and what is
-  missing.
-- `design/PROTOCOL.md` — the wire protocol, frame by frame.
-- `AGENTS.md` — internal contract and house rules. Read this before changing the
-  SDK itself.
-- `design/PORTING_FIBERS.md` — the durable-execution design in full.
+## Troubleshooting
+
+**The Worker still uses an older SDK build.** Rebuild the wheel, run
+`uv sync --reinstall-package agents-py`, remove `.venv-workers`, then restart
+`pywrangler`. A running development process does not hot-reload a vendored wheel.
+
+**Routing raises `no namespace found`.** Check that the class has a matching
+binding and that the binding uses the screaming-snake class name. A missing
+SQLite migration normally causes deployment to fail.
+
+**A normal GET to an Agent returns 404.** This is the default until the Agent
+implements `on_request()`. The WebSocket client can still connect at the same
+Agent route.
+
+**A WebSocket request returns the frontend HTML.** Add `/agents/*` to
+`assets.run_worker_first` so the Worker sees Agent routes before the SPA fallback.
+
+**State changes do not reach clients.** State must be a dictionary, and every
+server-side mutation must finish with `set_state()`.
+
+**A streaming RPC never resolves.** End every successful stream with `end()` and
+every handled failure with `error("reason")`.
+
+**Construction fails after a wake.** Keep application setup and table creation
+in `on_start()` rather than `__init__()`.
+
+**A sub-agent cannot start.** Export the child class from the Worker entry
+module. Configure a binding and migration for the root Agent only.
+
+## Client documentation
+
+- [Cloudflare Agents documentation](https://developers.cloudflare.com/agents/)
+- [Agents client API](https://developers.cloudflare.com/agents/api-reference/client-sdk/)
+- [Chat Agents](https://developers.cloudflare.com/agents/api-reference/chat-agents/)
+- [Callable methods](https://developers.cloudflare.com/agents/api-reference/callable-methods/)
