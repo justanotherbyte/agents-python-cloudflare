@@ -238,29 +238,17 @@ class Agent(DurableObject):
         )
 
         self._websockets = WebSockets(
-            on_connect=lambda connection, context: self._dispatch_connect(
-                connection, context
-            ),
-            on_message=lambda connection, message: self._dispatch_message(
-                connection, message
-            ),
-            on_close=lambda connection, code, reason, was_clean: self._dispatch_close(
-                connection, code, reason, was_clean
-            ),
-            on_error=lambda error, connection: self.on_error(error, connection),
-            get_connection_tags=lambda connection, context: self.get_connection_tags(
-                connection, context
-            ),
-            socket_source=lambda tag: self._owned_websockets(tag),
-            ensure_ready=lambda: self._ensure_initialized(),
-            before_upgrade=lambda request: self._before_websocket_upgrade(request),
-            relay_target_for_request=lambda request: (
-                self._websocket_relay_target_for_request(request)
-            ),
-            relay_target_is_valid=lambda target: self._websocket_relay_target_is_valid(
-                target
-            ),
-            relay_forward=lambda payload: self._forward_websocket_relay(payload),
+            on_connect=self._dispatch_connect,
+            on_message=self._dispatch_message,
+            on_close=self._dispatch_close,
+            on_error=self.on_error,
+            get_connection_tags=self.get_connection_tags,
+            socket_source=self._owned_websockets,
+            ensure_ready=self._ensure_initialized,
+            before_upgrade=self._before_websocket_upgrade,
+            relay_target_for_request=self._websocket_relay_target_for_request,
+            relay_target_is_valid=self._websocket_relay_target_is_valid,
+            relay_forward=self._forward_websocket_relay,
             relay_max_frames=relay_max_frames,
             relay_max_bytes=relay_max_bytes,
             relay_timeout=relay_timeout,
