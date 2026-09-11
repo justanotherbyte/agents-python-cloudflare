@@ -1,0 +1,10 @@
+{
+  "name": "agents-py-chat",
+  "main": "src/entry.py",
+  "compatibility_date": "2026-07-20",
+  "compatibility_flags": ["python_workers"],
+  "durable_objects": {
+    "bindings": [{ "class_name": "Assistant", "name": "ASSISTANT" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Assistant"] }]
+}

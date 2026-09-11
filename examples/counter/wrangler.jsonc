@@ -1,0 +1,10 @@
+{
+  "name": "agents-py-counter",
+  "main": "src/entry.py",
+  "compatibility_date": "2026-07-20",
+  "compatibility_flags": ["python_workers"],
+  "durable_objects": {
+    "bindings": [{ "class_name": "Counter", "name": "COUNTER" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }]
+}

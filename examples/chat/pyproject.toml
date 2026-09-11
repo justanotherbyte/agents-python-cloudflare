@@ -1,0 +1,14 @@
+[project]
+name = "agents-py-example-chat"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["agents-py"]
+
+[dependency-groups]
+dev = ["workers-py==1.17.2"]
+
+[tool.uv.sources]
+agents-py = { path = "../.." }
+
+[tool.pywrangler]
+allow-build = true
