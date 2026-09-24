@@ -1,0 +1,20 @@
+[project]
+name = "agents-py-example-mosslight-valley"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["agents-py"]
+
+[dependency-groups]
+dev = ["workers-py==1.17.2"]
+
+[tool.uv.sources]
+agents-py = { path = "../.." }
+
+# This RPC-only MCP example does not use the SDK's HTTP MCP/OAuth dependencies.
+[[tool.uv.dependency-metadata]]
+name = "agents-py"
+version = "0.1.0"
+requires-dist = ["pyodide-py>=0.27.7", "workers-runtime-sdk>=1.6.3"]
+
+[tool.pywrangler]
+allow-build = true

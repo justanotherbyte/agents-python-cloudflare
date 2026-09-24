@@ -5,6 +5,7 @@ These small Workers show the main ways to use the Python Agents SDK:
 | Example | What it shows |
 | --- | --- |
 | [`counter`](counter/) | Durable state and a callable RPC method |
+| [`mosslight-valley`](mosslight-valley/) | A pixel farm adventure driven by AIChatAgent and RPC MCP tools |
 | [`chat`](chat/) | Persisted, resumable chat responses |
 | [`background-task`](background-task/) | Replayable background work with durable steps |
 

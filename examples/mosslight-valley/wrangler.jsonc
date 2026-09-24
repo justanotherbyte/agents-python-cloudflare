@@ -1,0 +1,23 @@
+{
+  "name": "agents-py-mosslight-valley",
+  "main": "src/entry.py",
+  "compatibility_date": "2026-07-20",
+  "compatibility_flags": ["python_workers"],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "FarmGame", "name": "FARM_GAME" },
+      { "class_name": "FarmTools", "name": "FARM_TOOLS" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["FarmGame", "FarmTools"]
+    }
+  ],
+  "assets": {
+    "directory": "./frontend/dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/agents/*"]
+  }
+}

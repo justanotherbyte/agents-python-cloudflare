@@ -1,0 +1,19 @@
+lock-version = "1.0"
+created-by = "uv"
+requires-python = ">=3.13.2"
+
+[[packages]]
+name = "agents-py"
+directory = { path = "../../", editable = false }
+
+[[packages]]
+name = "pyodide-py"
+version = "0.29.5"
+sdist = { url = "https://files.pythonhosted.org/packages/1d/85/d89ea2de12b8da5e82d5d8c2c8a03f2aebd0830416d22d654b5cfe05c6d9/pyodide_py-0.29.5.tar.gz", upload-time = 2026-09-15T22:04:04Z, size = 58799, hashes = { sha256 = "a38d410aec95e2e2b3d59bdd93176b207db32952953bc3e9df81406a5ee3facd" } }
+wheels = [{ url = "https://files.pythonhosted.org/packages/82/b3/137eb4fcd365e1442e38e3470572cac2ec9eeadbf7a4c9c25bd791f6c757/pyodide_py-0.29.5-py3-none-any.whl", upload-time = 2026-09-15T22:04:02Z, size = 66017, hashes = { sha256 = "9d6d62c5167df01b1d8a94c762197f1fd89a5771fd78bbd07393c812d979352b" } }]
+
+[[packages]]
+name = "workers-runtime-sdk"
+version = "1.9.0"
+sdist = { url = "https://files.pythonhosted.org/packages/3d/be/6a9677e293b632d2a7d0db97d0a4952d8787cebf12bda22ba21cb4324441/workers_runtime_sdk-1.9.0.tar.gz", upload-time = 2026-09-18T21:08:38Z, size = 140950, hashes = { sha256 = "0dd83ed6d6a51a312a01e66bee6e6af8e8bed42bc40caae65642f8d41ab8b7b7" } }
+wheels = [{ url = "https://files.pythonhosted.org/packages/94/3d/053deb135d4db2ef6f6c3ccdeb86d7829de3c271f7ae02cec73da8f65891/workers_runtime_sdk-1.9.0-py3-none-any.whl", upload-time = 2026-09-18T21:08:37Z, size = 38585, hashes = { sha256 = "36209f94984686264db4e1fd410d51ac3460f2a2ab3cc29869699b975e1e1331" } }]
