@@ -1,0 +1,23 @@
+examples/mosslight-valley/frontend/package-lock.json
+  s_73dff590d463d8::t_0b984e06a9721c 1-3724
+examples/mosslight-valley/pylock.toml
+  s_73dff590d463d8::t_7f1413cad9affc 1-19
+examples/mosslight-valley/src/mosslight/mcp_server.py
+  s_73dff590d463d8::t_7b02daaf1315e2 1-160
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b5f880439863bb304c68b46b4a38d2eea6418dd9",
+  "prompts": {},
+  "sessions": {
+    "s_73dff590d463d8": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f9d8f0515ffeUuuvfI118Uz5pl",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Viswa M <wishymovies@gmail.com>"
+    }
+  }
+}
