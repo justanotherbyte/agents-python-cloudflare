@@ -1,0 +1,103 @@
+agents/_session_compaction.py
+  s_94293e88aa2f69::t_dff1706f22ee46 271,282,299
+agents/browser/protocols.py
+  s_7ddd27974f6bd1::t_e59a13503e4228 1-76
+agents/browser/quick_actions.py
+  s_88fa359724a061::t_3b77fef87c81b1 1-453
+agents/browser/spec.py
+  s_a508e6a0af962b::t_672559a96084d4 1-115
+agents/browser/types.py
+  s_88fa359724a061::t_9559a91838706e 1-124
+agents/chat/continuation.py
+  s_a1ca6c52e0cca5::t_568c1503681cfb 1-173
+agents/chat/resumable_stream.py
+  s_a1ca6c52e0cca5::t_3e11b0db8d444d 10,33,47,110,158-159,163-170,200-203,207-213,220,229,313-316,329-335,337-339,341-342,346,351-352,356-360,369-370,374-378,390,395-401,406-407,409-414,416-420,425-431,436-437,439-444,452,468,476-482,488,523,544,555-559,561,609,612,616,618-619,627,631,639,676
+agents/lifecycle/host_context.py
+  s_94293e88aa2f69::t_d9eeac438b590b 20
+agents/mcp/client/manager.py
+  s_a1ca6c52e0cca5::t_dd03cbefa6fa07 1-1419
+agents/mcp/client/oauth.py
+  s_a1ca6c52e0cca5::t_7dbee8a0a14e74 1-335
+agents/mcp/client/storage.py
+  s_a1ca6c52e0cca5::t_b80601536b8cb0 1-246
+agents/mcp/server/__init__.py
+  s_a508e6a0af962b::t_9161431a02c013 1-27
+agents/mcp/server/_handler.py
+  s_88fa359724a061::t_6e1e41b1192aff 1-689
+tests/browser/test_store.py
+  s_a508e6a0af962b::t_7b48cd5d0d0dc2 1-59
+tests/chat/test_chat_recovery.py
+  s_a1ca6c52e0cca5::t_8a04eb06d0c031 8,10-12,37,51-59,108-112,133,140,146-176,178-182,226,262-263,267,285,300,302,313,315-316,320,351-352,366,402,420,431,441,446-447,459,473,477,480-483,486,488-489,509,529,551,557-726
+tests/chat/test_recovery_policy.py
+  s_3bad2ea2f52325::t_cc8a2ebc082112 1-104
+tests/chat/test_tool_answers.py
+  s_a1ca6c52e0cca5::t_908f19f9f70d65 653-659,661-665,667-766,768-777,779-846
+tests/chat/test_turn.py
+  s_a1ca6c52e0cca5::t_7854ae77f67366 76-132
+tests/mcp/client/test_manager.py
+  s_a508e6a0af962b::t_5c55980ea1d0a1 1-282
+tests/mcp/client/test_oauth_elicitation.py
+  s_a1ca6c52e0cca5::t_bedc50f01cb0f0 1-241
+tests/mcp/client/test_review_regressions.py
+  s_88fa359724a061::t_7315cc31045640 1-595
+tests/workflows/conftest.py
+  s_88fa359724a061::t_db309684c7a19a 1-13
+tests/workflows/test_operations.py
+  s_7ddd27974f6bd1::t_603ca0a44346aa 1-495
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5e15d1333f181fd46ea96d11e60c91dc0a076e62",
+  "prompts": {},
+  "sessions": {
+    "s_3bad2ea2f52325": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f606929d5ffejPjoXF9fXCPk5u",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Viswa M <wishymovies@gmail.com>"
+    },
+    "s_7ddd27974f6bd1": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f60812798ffeimMBaLI0EyO3ns",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Viswa M <wishymovies@gmail.com>"
+    },
+    "s_88fa359724a061": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f608127beffeIqgUTK3emby7hG",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Viswa M <wishymovies@gmail.com>"
+    },
+    "s_94293e88aa2f69": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f2c480742ffeww1eLRcHE04MZP",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Viswa M <wishymovies@gmail.com>"
+    },
+    "s_a1ca6c52e0cca5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f608127b5ffep9M6nNIdjH3PO1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Viswa M <wishymovies@gmail.com>"
+    },
+    "s_a508e6a0af962b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f60812713ffek0MVRclqNEK7bE",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Viswa M <wishymovies@gmail.com>"
+    }
+  }
+}
