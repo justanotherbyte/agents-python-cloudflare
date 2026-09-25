@@ -4,10 +4,11 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
-__all__ = [
+__all__ = (
     "ACTION_DESTINATIONS",
     "BLOCKED_TILES",
     "CHARACTER_ACTION_DESTINATIONS",
+    "JOB_SPECIALISTS",
     "GRID_HEIGHT",
     "GRID_WIDTH",
     "act_on_farm",
@@ -16,8 +17,7 @@ __all__ = [
     "move_world",
     "near",
     "reset_world",
-    "upgrade_world",
-]
+)
 
 WEATHER = ("soft sun", "leafy breeze", "silver rain", "soft sun")
 GRID_WIDTH = 18
@@ -56,35 +56,20 @@ ACTION_DESTINATIONS = {
     "sell": (14, 2),
     "rest": (4, 2),
 }
+# Each villager only travels to the jobs that fit their persona; everyone may rest.
 CHARACTER_ACTION_DESTINATIONS = {
-    "mira": ACTION_DESTINATIONS,
-    "bramble": {
-        "plant": (7, 6),
-        "water": (7, 6),
-        "harvest": (7, 6),
-        "forage": (14, 10),
-        "fish": (12, 4),
-        "sell": (14, 3),
-        "rest": (5, 3),
-    },
-    "nori": {
-        "plant": (7, 5),
-        "water": (7, 5),
-        "harvest": (7, 5),
-        "forage": (14, 11),
-        "fish": (12, 3),
-        "sell": (15, 1),
-        "rest": (12, 6),
-    },
-    "tansy": {
-        "plant": (6, 7),
-        "water": (6, 7),
-        "harvest": (6, 7),
-        "forage": (14, 12),
-        "fish": (12, 2),
-        "sell": (16, 2),
-        "rest": (13, 2),
-    },
+    "mira": {"plant": (4, 4), "water": (4, 4), "harvest": (4, 4), "rest": (4, 2)},
+    "bramble": {"forage": (14, 10), "rest": (5, 3)},
+    "nori": {"fish": (12, 3), "rest": (13, 7)},
+    "tansy": {"sell": (15, 3), "rest": (13, 2)},
+}
+JOB_SPECIALISTS = {
+    "plant": ("mira", "planting"),
+    "water": ("mira", "watering"),
+    "harvest": ("mira", "harvest"),
+    "forage": ("bramble", "foraging"),
+    "fish": ("nori", "fishing"),
+    "sell": ("tansy", "selling"),
 }
 
 
@@ -126,8 +111,8 @@ def initial_world() -> dict[str, Any]:
             },
             "tansy": {
                 "name": "Tansy",
-                "x": 16,
-                "y": 2,
+                "x": 15,
+                "y": 3,
                 "energy": 6,
                 "maxEnergy": 6,
                 "activity": "Chalking prices on the market board",
@@ -149,48 +134,6 @@ def initial_world() -> dict[str, Any]:
     }
 
 
-def upgrade_world(current: Mapping[str, Any]) -> dict[str, Any]:
-    defaults = initial_world()
-    state = deepcopy(dict(current))
-    state.setdefault("generation", defaults["generation"])
-    state.setdefault("revision", defaults["revision"])
-    player = state.setdefault("player", defaults["player"])
-    player.setdefault("facing", "south")
-    characters = state.setdefault("characters", {})
-    occupied = {(player["x"], player["y"])}
-    occupied.update(
-        (character["x"], character["y"]) for character in characters.values()
-    )
-    for character_id, character in defaults["characters"].items():
-        if character_id in characters:
-            continue
-        added = deepcopy(character)
-        preferred = (added["x"], added["y"])
-        if preferred in occupied or preferred in BLOCKED_TILES:
-            preferred = min(
-                (
-                    (x, y)
-                    for y in range(1, GRID_HEIGHT + 1)
-                    for x in range(1, GRID_WIDTH + 1)
-                    if (x, y) not in occupied and (x, y) not in BLOCKED_TILES
-                ),
-                key=lambda point: (
-                    abs(point[0] - added["x"]) + abs(point[1] - added["y"]),
-                    point[1],
-                    point[0],
-                ),
-            )
-        added.update(x=preferred[0], y=preferred[1])
-        characters[character_id] = added
-        occupied.add(preferred)
-    friendship = state.setdefault("friendship", {})
-    for character_id in defaults["friendship"]:
-        friendship.setdefault(character_id, 0)
-    state.setdefault("turnReceipts", {})
-    state.setdefault("characterReceipts", {})
-    return state
-
-
 def _distance(left: Mapping[str, Any], right: Mapping[str, Any]) -> int:
     return abs(int(left["x"]) - int(right["x"])) + abs(int(left["y"]) - int(right["y"]))
 
@@ -202,7 +145,7 @@ def near(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
 def move_world(
     current: Mapping[str, Any], direction: str
 ) -> tuple[dict[str, Any], bool, str]:
-    state = upgrade_world(current)
+    state = deepcopy(dict(current))
     delta = MOVE_DELTAS.get(direction)
     if delta is None:
         return state, False, "Unknown direction"
@@ -407,12 +350,19 @@ def act_on_farm(
     target: str,
     actor: str = "wisp",
 ) -> dict[str, Any]:
-    state = upgrade_world(current)
+    state = deepcopy(dict(current))
     inventory = state["inventory"]
     plots = state["plots"]
     if actor != "wisp" and actor not in state["characters"]:
         return _tool_result(state, f"Unknown valley character: {actor}.", action)
     name = _actor_name(state, actor)
+    if actor != "wisp" and action in JOB_SPECIALISTS:
+        specialist, job = JOB_SPECIALISTS[action]
+        if specialist != actor:
+            specialist_name = state["characters"][specialist]["name"]
+            return _tool_result(
+                state, f"{name} leaves the {job} to {specialist_name}.", action
+            )
     blocked = _prepare_action(state, actor, action, target)
     if blocked is not None:
         return _tool_result(state, blocked, action)

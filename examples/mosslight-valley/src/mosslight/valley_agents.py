@@ -9,7 +9,7 @@ from agents.mcp.client import MCPConnectionState
 
 from . import conversation, mcp_server, world
 
-__all__ = ["BrambleAgent", "FarmGame", "MiraAgent", "NoriAgent", "TansyAgent"]
+__all__ = ("BrambleAgent", "FarmGame", "MiraAgent", "NoriAgent", "TansyAgent")
 
 
 async def ensure_mcp_connection(agent: AIChatAgent) -> None:
@@ -36,9 +36,6 @@ class FarmGame(AIChatAgent):
         return world.initial_world()
 
     async def on_start(self):
-        upgraded = world.upgrade_world(self.state)
-        if upgraded != self.state:
-            self.set_state(upgraded)
         await ensure_mcp_connection(self)
         await self.sub_agent(MiraAgent, "mira")
         await self.sub_agent(BrambleAgent, "bramble")
@@ -81,7 +78,7 @@ class FarmGame(AIChatAgent):
         expected_generation: int,
         expected_revision: int,
     ):
-        current = world.upgrade_world(self.state)
+        current = self.state
         if current["generation"] != expected_generation:
             return {
                 "valid": False,
@@ -110,7 +107,7 @@ class FarmGame(AIChatAgent):
         action: str,
         target: str,
     ):
-        current = world.upgrade_world(self.state)
+        current = self.state
         if (
             actor not in current["characters"]
             or action not in world.ACTION_DESTINATIONS
@@ -161,9 +158,9 @@ class FarmGame(AIChatAgent):
         if not isinstance(candidate_state, Mapping) or not isinstance(narration, str):
             return {"applied": False, "state": current}
         if self.state["revision"] != expected_revision:
-            return {"applied": False, "state": world.upgrade_world(self.state)}
+            return {"applied": False, "state": self.state}
 
-        state = world.upgrade_world(candidate_state)
+        state = dict(candidate_state)
         state["player"] = deepcopy(current["player"])
         state["revision"] = expected_revision + 1
         state["characterReceipts"] = deepcopy(current["characterReceipts"])
@@ -246,7 +243,7 @@ class FarmGame(AIChatAgent):
             yield "The world moved beneath your feet. Try that action once more."
             return
 
-        next_state = world.upgrade_world(state)
+        next_state = dict(state)
         next_state["revision"] = revision + 1
         conversation.remember_turn(next_state, message_id, narration, tool_name)
         self.set_state(next_state)
@@ -254,7 +251,7 @@ class FarmGame(AIChatAgent):
         yield f"  [MCP / {tool_name}]"
 
 
-class _ValleyCharacter(AIChatAgent):
+class ValleyCharacter(AIChatAgent):
     character_id = ""
     max_persisted_messages = 80
 
@@ -270,9 +267,7 @@ class _ValleyCharacter(AIChatAgent):
 
         message_id, player_message = conversation.latest_player_message(self.messages)
         parent = await self.parent_agent(FarmGame)
-        snapshot = world.upgrade_world(
-            conversation.runtime_value(await parent.world_snapshot())
-        )
+        snapshot = conversation.runtime_value(await parent.world_snapshot())
         turn_generations = dict(self.state.get("turnGenerations") or {})
         accepted_generation = turn_generations.get(message_id)
         receipt_generation = (
@@ -363,10 +358,11 @@ class _ValleyCharacter(AIChatAgent):
                     narration = attempt_narration
                     break
                 if guard.get("retry") and attempt == 0:
-                    snapshot = world.upgrade_world(guard["state"])
+                    snapshot = guard["state"]
                     continue
                 narration = str(guard["reason"])
                 tool_name = "world_guard"
+                snapshot = conversation.runtime_value(await parent.world_snapshot())
                 break
         else:
             for _ in range(2):
@@ -401,22 +397,43 @@ class _ValleyCharacter(AIChatAgent):
                 )
                 if commit.get("applied"):
                     narration = str(commit["narration"])
+                    snapshot = commit["state"]
                     break
                 if commit.get("cancelled"):
                     narration = str(commit["reason"])
                     tool_name = "world_guard"
+                    snapshot = commit["state"]
                     break
-                snapshot = world.upgrade_world(commit["state"])
+                snapshot = commit["state"]
 
         if not narration:
             narration = "The farm tools rustle, but return no clear answer."
-        reply = conversation.character_reply(
+        report_revision = snapshot["revision"]
+        snapshot = conversation.runtime_value(await parent.world_snapshot())
+        if snapshot["generation"] != accepted_generation:
+            yield "That conversation belonged to the previous farm. Please ask again."
+            return
+        if snapshot["revision"] != report_revision:
+            yield "The world moved beneath your feet. Please ask again."
+            return
+        reply = await conversation.model_character_reply(
+            self.env.AI,
             self.character_id,
+            message_id,
             player_message,
             narration,
+            snapshot,
+            self.messages,
             acted=tool_name == "act_on_farm",
         )
+        current = conversation.runtime_value(await parent.world_snapshot())
         if options.aborted:
+            return
+        if current["generation"] != accepted_generation:
+            yield "That conversation belonged to the previous farm. Please ask again."
+            return
+        if current["revision"] != snapshot["revision"]:
+            yield "The world moved beneath your feet. Please ask again."
             return
         next_state = deepcopy(self.state)
         conversation.remember_turn(
@@ -431,17 +448,17 @@ class _ValleyCharacter(AIChatAgent):
         yield f"  [MCP / {tool_name}]"
 
 
-class MiraAgent(_ValleyCharacter):
+class MiraAgent(ValleyCharacter):
     character_id = "mira"
 
 
-class BrambleAgent(_ValleyCharacter):
+class BrambleAgent(ValleyCharacter):
     character_id = "bramble"
 
 
-class NoriAgent(_ValleyCharacter):
+class NoriAgent(ValleyCharacter):
     character_id = "nori"
 
 
-class TansyAgent(_ValleyCharacter):
+class TansyAgent(ValleyCharacter):
     character_id = "tansy"

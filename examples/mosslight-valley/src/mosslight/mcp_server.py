@@ -9,10 +9,10 @@ from workers import DurableObject
 from .world import act_on_farm, inspect_farm
 
 __all__ = (
-    "FarmTools",
     "MCP_PROTOCOL_VERSION",
     "MCP_SERVER_ID",
     "TOOLS",
+    "FarmTools",
 )
 
 MCP_SERVER_ID = "mosslight-tools"

@@ -3,6 +3,7 @@
   "main": "src/entry.py",
   "compatibility_date": "2026-07-20",
   "compatibility_flags": ["python_workers"],
+  "ai": { "binding": "AI" },
   "durable_objects": {
     "bindings": [
       { "class_name": "FarmGame", "name": "FARM_GAME" },

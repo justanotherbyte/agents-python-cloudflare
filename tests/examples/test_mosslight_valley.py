@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -82,55 +84,24 @@ def test_movement_is_cardinal_server_authoritative_and_collision_aware() -> None
     assert blocked["revision"] == 1
 
 
-def test_expanded_world_adds_new_characters_to_persisted_state() -> None:
-    legacy = world.initial_world()
-    del legacy["characters"]["nori"]
-    del legacy["characters"]["tansy"]
-    del legacy["friendship"]["nori"]
-    del legacy["friendship"]["tansy"]
+def test_character_destinations_are_passable_and_rest_spots_distinct() -> None:
+    jobs = world.CHARACTER_ACTION_DESTINATIONS.values()
+    rest_spots = [destinations["rest"] for destinations in jobs]
 
-    upgraded = world.upgrade_world(legacy)
-
-    assert (world.GRID_WIDTH, world.GRID_HEIGHT) == (18, 12)
-    assert upgraded["characters"]["nori"]["name"] == "Nori"
-    assert upgraded["characters"]["tansy"]["name"] == "Tansy"
-    assert upgraded["friendship"]["nori"] == 0
-    assert upgraded["friendship"]["tansy"] == 0
+    assert len(rest_spots) == len(set(rest_spots))
+    for destinations in jobs:
+        assert not set(destinations.values()) & world.BLOCKED_TILES
 
 
-@pytest.mark.parametrize(
-    ("character_id", "x", "y"), (("nori", 12, 5), ("tansy", 16, 2))
-)
-def test_expanded_world_avoids_occupied_character_spawns(
-    character_id: str, x: int, y: int
-) -> None:
-    legacy = world.initial_world()
-    del legacy["characters"][character_id]
-    legacy["player"].update(x=x, y=y)
-
-    upgraded = world.upgrade_world(legacy)
-    character = upgraded["characters"][character_id]
-
-    assert (character["x"], character["y"]) != (x, y)
-    assert (character["x"], character["y"]) not in world.BLOCKED_TILES
+CHARACTER_JOBS = [
+    (actor, action)
+    for actor, destinations in world.CHARACTER_ACTION_DESTINATIONS.items()
+    for action in destinations
+]
 
 
-def test_character_destinations_are_distinct_and_passable() -> None:
-    for action in ("plant", "water", "harvest", "forage", "fish", "sell", "rest"):
-        destinations = [
-            actions[action] for actions in world.CHARACTER_ACTION_DESTINATIONS.values()
-        ]
-        assert len(destinations) == len(set(destinations))
-        assert not set(destinations) & world.BLOCKED_TILES
-
-
-@pytest.mark.parametrize("actor", ("mira", "bramble", "nori", "tansy"))
-@pytest.mark.parametrize(
-    "action", ("plant", "water", "harvest", "forage", "fish", "sell", "rest")
-)
-def test_every_character_can_reach_each_action_destination(
-    actor: str, action: str
-) -> None:
+@pytest.mark.parametrize(("actor", "action"), CHARACTER_JOBS)
+def test_every_character_can_reach_each_of_their_jobs(actor: str, action: str) -> None:
     result = world.act_on_farm(world.initial_world(), action, "", actor)
     structured = result["structuredContent"]
     character = structured["state"]["characters"][actor]
@@ -139,6 +110,52 @@ def test_every_character_can_reach_each_action_destination(
     assert (character["x"], character["y"]) == (
         world.CHARACTER_ACTION_DESTINATIONS[actor][action]
     )
+
+
+@pytest.mark.parametrize(("actor", "action"), CHARACTER_JOBS)
+def test_wisp_standing_beside_a_character_never_boxes_them_in(
+    actor: str, action: str
+) -> None:
+    initial = world.initial_world()
+    home = initial["characters"][actor]
+    occupied = {(other["x"], other["y"]) for other in initial["characters"].values()}
+    approaches = [
+        (home["x"] + dx, home["y"] + dy)
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0))
+        if (home["x"] + dx, home["y"] + dy) not in world.BLOCKED_TILES | occupied
+    ]
+    assert approaches
+
+    for x, y in approaches:
+        state = world.initial_world()
+        state["player"].update(x=x, y=y)
+        narration = world.act_on_farm(state, action, "", actor)["structuredContent"][
+            "narration"
+        ]
+        assert "cannot find a clear path" not in narration, (x, y)
+
+
+@pytest.mark.parametrize(
+    ("actor", "action", "expected"),
+    (
+        ("tansy", "plant", "Tansy leaves the planting to Mira."),
+        ("mira", "fish", "Mira leaves the fishing to Nori."),
+        ("nori", "sell", "Nori leaves the selling to Tansy."),
+        ("bramble", "water", "Bramble leaves the watering to Mira."),
+    ),
+)
+def test_characters_decline_work_outside_their_specialty(
+    actor: str, action: str, expected: str
+) -> None:
+    initial = world.initial_world()
+
+    structured = world.act_on_farm(initial, action, "", actor)["structuredContent"]
+
+    assert structured["narration"] == expected
+    state = structured["state"]
+    assert state["inventory"] == initial["inventory"]
+    assert state["plots"] == initial["plots"]
+    assert state["characters"][actor] == initial["characters"][actor]
 
 
 def test_npc_talk_moves_next_to_the_target() -> None:
@@ -198,14 +215,6 @@ def test_npc_action_rejects_an_occupied_destination() -> None:
     assert "cannot find a clear path" in result["structuredContent"]["narration"]
     assert initial["characters"]["bramble"]["energy"] == 6
     assert result["structuredContent"]["state"]["characters"]["bramble"]["energy"] == 6
-
-
-def test_tansy_spawn_has_a_walkable_approach() -> None:
-    state = world.initial_world()
-    approach = {"x": 16, "y": 3}
-
-    assert (approach["x"], approach["y"]) not in world.BLOCKED_TILES
-    assert world.near(approach, state["characters"]["tansy"])
 
 
 @pytest.mark.parametrize(("action", "place"), (("fish", "pond"), ("forage", "forest")))
@@ -366,8 +375,241 @@ def test_character_receipt_is_fenced_by_farm_generation() -> None:
     assert conversation.turn_receipt(state, "message", 4) is None
 
 
+def test_selling_the_harvest_selects_sell() -> None:
+    assert conversation.choose_action("Please sell the harvest")[0] == "sell"
+    assert conversation.choose_action("Harvest every ripe crop")[0] == "harvest"
+
+
 def test_friendship_does_not_select_the_shipping_action() -> None:
     assert conversation.choose_action("How is our friendship?")[0] is None
+
+
+@pytest.mark.asyncio
+async def test_character_dialogue_uses_persona_world_context_and_gateway() -> None:
+    class Ai:
+        def __init__(self) -> None:
+            self.call = None
+
+        async def run(self, model: str, inputs: dict, options: dict):
+            self.call = (model, inputs, options)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "The roots look ready for a patient hand.",
+                        }
+                    }
+                ]
+            }
+
+    ai = Ai()
+    snapshot = world.initial_world()
+    messages = [
+        {
+            "id": "older-user",
+            "role": "user",
+            "parts": [{"type": "text", "text": "How are the turnips?"}],
+        },
+        {
+            "id": "current-user",
+            "role": "user",
+            "parts": [{"type": "text", "text": "Please water them"}],
+        },
+    ]
+
+    reply = await conversation.model_character_reply(
+        ai,
+        "mira",
+        "current-user",
+        "Please water them",
+        "Mira watered two thirsty plots.",
+        snapshot,
+        messages,
+        acted=True,
+    )
+
+    assert reply == "The roots look ready for a patient hand."
+    model, inputs, options = ai.call
+    assert model == "@cf/zai-org/glm-4.7-flash"
+    assert options == {"gateway": {"id": "default", "skipCache": True}}
+    assert inputs["max_completion_tokens"] == 160
+    assert inputs["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "patient botanist" in inputs["messages"][0]["content"]
+    assert inputs["messages"][1] == {
+        "role": "user",
+        "content": "How are the turnips?",
+    }
+    current = inputs["messages"][-1]["content"]
+    assert "Mira watered two thirsty plots." in current
+    assert "Friendship with Wisp is 0" in current
+    assert "Please water them" in current
+    assert current.count("Please water them") == 1
+
+
+@pytest.mark.asyncio
+async def test_character_dialogue_reports_plainly_when_inference_fails(caplog) -> None:
+    class Ai:
+        async def run(self, *_args, **_kwargs):
+            raise RuntimeError("inference unavailable")
+
+    reply = await conversation.model_character_reply(
+        Ai(),
+        "nori",
+        "current-user",
+        "How is the pond?",
+        "The pond is calm today.",
+        world.initial_world(),
+        [],
+        acted=False,
+    )
+
+    assert reply == "The pond is calm today."
+    assert "character dialogue inference failed" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("character", "persona"),
+    (
+        ("mira", "patient botanist"),
+        ("bramble", "playful forest forager"),
+        ("nori", "quiet fisher"),
+        ("tansy", "brisk market keeper"),
+    ),
+)
+def test_each_character_has_a_distinct_model_persona(
+    character: str, persona: str
+) -> None:
+    prompt = conversation._model_messages(
+        character,
+        "message",
+        "Hello",
+        "The farm is quiet.",
+        world.initial_world(),
+        [],
+        acted=False,
+    )[0]["content"]
+
+    assert persona in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("world_change", "expected"),
+    (
+        (
+            "reset",
+            ["That conversation belonged to the previous farm. Please ask again."],
+        ),
+        ("revision", ["The world moved beneath your feet. Please ask again."]),
+        ("before_model", ["The world moved beneath your feet. Please ask again."]),
+        ("abort", []),
+    ),
+)
+async def test_character_does_not_persist_reply_across_world_change(
+    world_change: str, expected: list[str]
+) -> None:
+    class Ai:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def run(self, *_args, **_kwargs):
+            self.started.set()
+            await self.release.wait()
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "Those old roots still look healthy.",
+                        }
+                    }
+                ]
+            }
+
+    class Mcp:
+        def get_connection(self, _server_id: str):
+            return SimpleNamespace(state=valley_agents.MCPConnectionState.READY)
+
+        async def call_tool(self, _server_id: str, _name: str, arguments: dict):
+            return world.inspect_farm(arguments["state"])
+
+    class Parent:
+        def __init__(self) -> None:
+            self.state = world.initial_world()
+            self.state["player"].update(x=5, y=3)
+            self.snapshot_calls = 0
+            self.post_inference_snapshot = asyncio.Event()
+            self.release_snapshot = asyncio.Event()
+
+        async def world_snapshot(self):
+            self.snapshot_calls += 1
+            if world_change == "before_model" and self.snapshot_calls == 2:
+                self.state["revision"] += 1
+            if world_change == "abort" and self.snapshot_calls == 3:
+                self.post_inference_snapshot.set()
+                await self.release_snapshot.wait()
+            return deepcopy(self.state)
+
+        async def validate_character_turn(
+            self, actor: str, generation: int, revision: int
+        ):
+            return valley_agents.FarmGame.validate_character_turn(
+                self, actor, generation, revision
+            )
+
+    class Character:
+        character_id = "mira"
+
+        def __init__(self, parent: Parent, ai: Ai) -> None:
+            self.state = {"turnReceipts": {}, "turnGenerations": {}}
+            self.messages = [
+                {
+                    "id": "user-1",
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "How is the farm?"}],
+                }
+            ]
+            self.mcp = Mcp()
+            self.env = SimpleNamespace(AI=ai)
+            self.parent = parent
+
+        async def parent_agent(self, _parent_type):
+            return self.parent
+
+        def set_state(self, state: dict) -> None:
+            self.state = state
+
+    parent = Parent()
+    ai = Ai()
+    character = Character(parent, ai)
+    options = SimpleNamespace(aborted=False, continuation=False)
+
+    async def collect_reply() -> list[str]:
+        return [
+            chunk
+            async for chunk in valley_agents.MiraAgent.on_chat_message(
+                character, options
+            )
+        ]
+
+    turn = asyncio.create_task(collect_reply())
+    if world_change != "before_model":
+        await ai.started.wait()
+        if world_change == "reset":
+            parent.state = world.reset_world(parent.state)
+        elif world_change == "revision":
+            parent.state["revision"] += 1
+        ai.release.set()
+    if world_change == "abort":
+        await parent.post_inference_snapshot.wait()
+        options.aborted = True
+        parent.release_snapshot.set()
+
+    assert await turn == expected
+    assert ai.started.is_set() is (world_change != "before_model")
+    assert character.state["turnReceipts"] == {}
 
 
 @pytest.mark.asyncio

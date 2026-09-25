@@ -2,6 +2,35 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties, FormEvent } from "react";
 import { useAgentChat } from "@cloudflare/ai-chat/react";
 import { useAgent } from "agents/react";
+import {
+  BERRIES,
+  BRAMBLE,
+  BRAMBLE_PORTRAIT,
+  DIRT_PATH,
+  FARMHOUSE,
+  FISH_ITEM,
+  GRASS_TILES,
+  LANTERN_SPIRIT_PORTRAIT,
+  MARKET,
+  MIRA,
+  MIRA_PORTRAIT,
+  NORI,
+  NORI_PORTRAIT,
+  SEEDS,
+  SOIL_DRY,
+  SOIL_WET,
+  TANSY,
+  TANSY_PORTRAIT,
+  TREE,
+  TURNIPS,
+  TURNIP_STAGES,
+  WATER_FRAMES,
+  WISP,
+  WOOD_ITEM,
+} from "./assets/pixel";
+import type { Art } from "./assets/pixel";
+import { artUrl } from "./pixelArt";
+import { TitleScreen } from "./TitleScreen";
 
 type Plot = {
   crop: string | null;
@@ -50,6 +79,7 @@ type McpCatalog = {
 
 const GRID_WIDTH = 18;
 const GRID_HEIGHT = 12;
+const ART_SIZE = 16;
 
 const PLOTS = [
   [3, 5],
@@ -96,11 +126,11 @@ const QUICK_ACTIONS = [
 ] as const;
 
 const INVENTORY_ITEMS = [
-  ["seeds", "Seeds"],
-  ["turnips", "Turnips"],
-  ["berries", "Berries"],
-  ["fish", "Fish"],
-  ["wood", "Wood"],
+  ["seeds", "Seeds", SEEDS],
+  ["turnips", "Turnips", TURNIPS],
+  ["berries", "Berries", BERRIES],
+  ["fish", "Fish", FISH_ITEM],
+  ["wood", "Wood", WOOD_ITEM],
 ] as const;
 
 const CHARACTERS = {
@@ -110,6 +140,9 @@ const CHARACTERS = {
     kind: "mira",
     agent: "MiraAgent",
     route: "mira-agent",
+    request: "water the crops",
+    sprite: MIRA,
+    portrait: MIRA_PORTRAIT,
     role: "Seed keeper and garden agent",
   },
   bramble: {
@@ -118,6 +151,9 @@ const CHARACTERS = {
     kind: "bramble",
     agent: "BrambleAgent",
     route: "bramble-agent",
+    request: "forage in Fernwood",
+    sprite: BRAMBLE,
+    portrait: BRAMBLE_PORTRAIT,
     role: "Forager and woodland agent",
   },
   nori: {
@@ -126,6 +162,9 @@ const CHARACTERS = {
     kind: "nori",
     agent: "NoriAgent",
     route: "nori-agent",
+    request: "go fishing",
+    sprite: NORI,
+    portrait: NORI_PORTRAIT,
     role: "Fisher and pond-watching agent",
   },
   tansy: {
@@ -134,6 +173,9 @@ const CHARACTERS = {
     kind: "tansy",
     agent: "TansyAgent",
     route: "tansy-agent",
+    request: "sell the harvest",
+    sprite: TANSY,
+    portrait: TANSY_PORTRAIT,
     role: "Merchant and market agent",
   },
 } as const;
@@ -158,28 +200,60 @@ function tileKind(x: number, y: number) {
   return "grass";
 }
 
+function tileArt(
+  kind: ReturnType<typeof tileKind>,
+  x: number,
+  y: number,
+  plot: Plot | null,
+) {
+  if (kind === "water") return WATER_FRAMES;
+  if (kind === "forest") return TREE;
+  if (kind === "path") return DIRT_PATH;
+  if (kind === "market") return MARKET;
+  if (kind === "soil") return plot?.watered ? SOIL_WET : SOIL_DRY;
+  return GRASS_TILES[tileHash(x, y) % GRASS_TILES.length];
+}
+
+// Stable per-tile noise so grass variants scatter instead of forming rows or diagonals.
+function tileHash(x: number, y: number) {
+  let hash = Math.imul(x, 374761393) + Math.imul(y, 668265263);
+  hash = Math.imul(hash ^ (hash >>> 13), 1274126177);
+  return (hash ^ (hash >>> 16)) >>> 0;
+}
+
+function wispArt(facing: string) {
+  if (facing === "north") return WISP.north;
+  if (facing === "west" || facing === "east") return WISP.west;
+  return WISP.south;
+}
+
 function Sprite({
   kind,
   name,
+  art,
   x,
   y,
+  flipped = false,
   nearby = false,
   description,
   onInteract,
 }: {
   kind: "player" | CharacterDefinition["kind"];
   name: string;
+  art: Art;
   x: number;
   y: number;
+  flipped?: boolean;
   nearby?: boolean;
   description?: string;
   onInteract?: () => void;
 }) {
   const contents = (
     <>
-      <span className="sprite-shadow" />
-      <span className="sprite-body" />
-      <span className="sprite-head" />
+      <span
+        className={`sprite-art pixel ${flipped ? "is-flipped" : ""}`}
+        style={{ backgroundImage: artUrl(art) }}
+      />
       <b>{name}</b>
       {nearby && kind !== "player" && (
         <span className="talk-tooltip" aria-hidden="true">
@@ -257,26 +331,24 @@ function FarmMap({
       const kind = tileKind(x, y);
       tiles.push(
         <div
-          className={`tile tile-${kind} tile-${(x + y) % 2 ? "odd" : "even"}`}
+          className={`tile pixel tile-${kind}`}
           key={`${x}:${y}`}
-          style={{ gridColumn: x, gridRow: y }}
+          style={{
+            gridColumn: x,
+            gridRow: y,
+            backgroundImage: artUrl(tileArt(kind, x, y, plot)),
+          }}
           aria-hidden="true"
         >
-          {kind === "house" && x === 2 && y === 1 && (
-            <div className="farmhouse">
-              <i className="roof" />
-              <i className="door" />
-              <i className="window" />
-            </div>
-          )}
-          {kind === "market" && <span className="market-stall">SHOP</span>}
-          {kind === "forest" && <span className="tree"><i /></span>}
           {plot?.crop && (
             <span
-              className={`crop crop-stage-${plot.stage} ${plot.watered ? "is-watered" : ""}`}
-            >
-              <i />
-            </span>
+              className="crop pixel"
+              style={{
+                backgroundImage: artUrl(
+                  TURNIP_STAGES[Math.min(plot.stage, TURNIP_STAGES.length - 1)],
+                ),
+              }}
+            />
           )}
         </div>,
       );
@@ -292,11 +364,13 @@ function FarmMap({
       const portrait = bounds.width <= 760 && bounds.height > bounds.width;
       const landscapePhone = bounds.width <= 760 && bounds.height <= bounds.width;
       const shortMobile = landscapePhone && bounds.height <= 600;
-      const tileSize = portrait
+      const fittedTileSize = portrait
         ? Math.max(bounds.width / 5, bounds.height / 8)
         : landscapePhone
           ? Math.max(bounds.width / 8, bounds.height / 5)
           : Math.max(bounds.width / 10, bounds.height / 6);
+      // Whole screen pixels per art pixel keep 16px sprites crisp and even.
+      const tileSize = Math.max(ART_SIZE, Math.round(fittedTileSize / ART_SIZE) * ART_SIZE);
       const width = tileSize * GRID_WIDTH;
       const height = tileSize * GRID_HEIGHT;
       const playerX = (state.player.x - 0.5) * tileSize;
@@ -396,7 +470,7 @@ function FarmMap({
       const x = Math.min(playLeft, Math.max(playRight - width, desiredX));
       const y = Math.min(playTop, Math.max(playBottom - height, desiredY));
 
-      setCamera({ width, height, x, y });
+      setCamera({ width, height, x: Math.round(x), y: Math.round(y) });
     };
 
     updateCamera();
@@ -443,6 +517,15 @@ function FarmMap({
         aria-label={`Mosslight Valley farm map. Wisp is at ${state.player.x}, ${state.player.y}. ${planted} plots are planted and ${ready} are ready to harvest. ${Object.values(state.characters).map((character) => `${character.name} is at ${character.x}, ${character.y}`).join(". ")}.`}
       >
         {tiles}
+        <div
+          className="farmhouse pixel"
+          style={{
+            gridColumn: "1 / 4",
+            gridRow: "1 / 3",
+            backgroundImage: artUrl(FARMHOUSE),
+          }}
+          aria-hidden="true"
+        />
         {(Object.keys(CHARACTERS) as CharacterId[]).map((id) => {
           const definition = CHARACTERS[id];
           const character = state.characters[id];
@@ -451,6 +534,7 @@ function FarmMap({
               key={id}
               kind={definition.kind}
               name={definition.name}
+              art={definition.sprite}
               x={character.x}
               y={character.y}
               nearby={isNearby(state.player, character)}
@@ -462,6 +546,8 @@ function FarmMap({
         <Sprite
           kind="player"
           name="Wisp"
+          art={wispArt(state.player.facing)}
+          flipped={state.player.facing === "east"}
           x={state.player.x}
           y={state.player.y}
         />
@@ -531,13 +617,17 @@ function InventoryHotbar({ inventory }: { inventory: GameState["inventory"] }) {
     <aside className="inventory-hotbar" aria-label="Inventory hotbar">
       <strong>Pack</strong>
       <ul>
-        {INVENTORY_ITEMS.map(([item, label]) => (
+        {INVENTORY_ITEMS.map(([item, label, art]) => (
           <li
             className={inventory[item] === 0 ? "is-empty" : ""}
             key={item}
             aria-label={`${label}: ${inventory[item]}`}
           >
-            <i className={`item-icon item-${item}`} aria-hidden="true" />
+            <i
+              className="item-icon pixel"
+              style={{ backgroundImage: artUrl(art) }}
+              aria-hidden="true"
+            />
             <span>{label}</span>
             <b>{inventory[item]}</b>
           </li>
@@ -548,10 +638,12 @@ function InventoryHotbar({ inventory }: { inventory: GameState["inventory"] }) {
 }
 
 function CharacterChat({
+  farm,
   definition,
   character,
   onClose,
 }: {
+  farm: string;
   definition: CharacterDefinition;
   character: CharacterState;
   onClose: () => void;
@@ -564,7 +656,7 @@ function CharacterChat({
   const characterAgent = useAgent({
     agent: definition.agent,
     name: definition.id,
-    basePath: `agents/farm-game/wisp/sub/${definition.route}/${definition.id}`,
+    basePath: `agents/farm-game/${farm}/sub/${definition.route}/${definition.id}`,
   });
   const {
     messages,
@@ -620,10 +712,11 @@ function CharacterChat({
       aria-busy={busy}
     >
       <header>
-        <div className={`character-portrait portrait-${definition.kind}`} aria-hidden="true">
-          <i className="portrait-head" />
-          <i className="portrait-body" />
-        </div>
+        <div
+          className="character-portrait pixel"
+          style={{ backgroundImage: artUrl(definition.portrait) }}
+          aria-hidden="true"
+        />
         <div>
           <p>{definition.role}</p>
           <h2 id="character-title">{definition.name}</h2>
@@ -651,8 +744,8 @@ function CharacterChat({
             <span>Independent AI character</span>
             <h3>Talk to {definition.name}.</h3>
             <p>
-              Ask about the valley or request help with farming. {definition.name}
-              will inspect the shared world and choose MCP tools independently.
+              Ask about the valley, or ask {definition.name} to {definition.request}.
+              Each villager handles their own trade through MCP tools.
             </p>
           </div>
         )}
@@ -688,7 +781,7 @@ function CharacterChat({
             id={`command-${definition.id}`}
             value={input}
             onChange={(event) => setInput(event.target.value)}
-            placeholder={`Ask ${definition.name} to help water...`}
+            placeholder={`Ask ${definition.name} to ${definition.request}...`}
             autoComplete="off"
             autoFocus
           />
@@ -712,6 +805,12 @@ function CharacterChat({
 }
 
 export function App() {
+  const [farm, setFarm] = useState<string | null>(null);
+  if (farm === null) return <TitleScreen onPlay={setFarm} />;
+  return <Valley farm={farm} />;
+}
+
+function Valley({ farm }: { farm: string }) {
   const [state, setState] = useState<GameState | null>(null);
   const [mcp, setMcp] = useState<McpCatalog | null>(null);
   const [input, setInput] = useState("");
@@ -725,7 +824,7 @@ export function App() {
 
   const agent = useAgent<GameState>({
     agent: "FarmGame",
-    name: "wisp",
+    name: farm,
     onStateUpdate: setState,
     onMcpUpdate: (catalog) => setMcp(catalog as McpCatalog),
   });
@@ -938,7 +1037,7 @@ export function App() {
           <div className="panel-heading">
             <div>
               <span>Live shared world</span>
-              <h2 id="world-title">Wisp's farmstead</h2>
+              <h2 id="world-title">{farm}</h2>
             </div>
             <div
               className={`mcp-badge ${toolsReady ? "is-ready" : ""} ${toolsFailed ? "is-failed" : ""}`}
@@ -1029,6 +1128,7 @@ export function App() {
 
         {selectedCharacter ? (
           <CharacterChat
+            farm={farm}
             key={selectedCharacter}
             definition={CHARACTERS[selectedCharacter]}
             character={state.characters[selectedCharacter]}
@@ -1037,10 +1137,11 @@ export function App() {
         ) : (
         <aside className="spirit-panel" aria-labelledby="spirit-title">
           <header>
-            <div className="spirit-portrait" aria-hidden="true">
-              <i className="spirit-flame" />
-              <i className="spirit-face" />
-            </div>
+            <div
+              className="spirit-portrait pixel"
+              style={{ backgroundImage: artUrl(LANTERN_SPIRIT_PORTRAIT) }}
+              aria-hidden="true"
+            />
             <div>
               <p>AIChatAgent game master</p>
               <h2 id="spirit-title">Lantern Spirit</h2>
