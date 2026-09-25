@@ -1,4 +1,7 @@
 from importlib.util import find_spec
+from pathlib import Path
+import subprocess
+import sys
 
 import agents
 import agents.chat as chat_module
@@ -119,3 +122,23 @@ def test_removed_compatibility_modules_and_classes_are_absent():
     assert all(find_spec(module_name) is None for module_name in MOVED_FLAT_MODULES)
     assert not hasattr(fiber_module, "FiberSupport")
     assert not hasattr(agent_tools_module, "AgentToolSupport")
+
+
+def test_mcp_server_import_does_not_load_agent_or_client_modules():
+    root = Path(__file__).parents[2]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import _runtime_stubs; _runtime_stubs.install(); "
+            "import agents.mcp.server; import sys; "
+            "assert 'agents.core.agent' not in sys.modules; "
+            "assert 'agents.mcp.client' not in sys.modules",
+        ],
+        cwd=root,
+        env={"PYTHONPATH": str(root / "tests")},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr

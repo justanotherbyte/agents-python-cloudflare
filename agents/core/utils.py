@@ -9,7 +9,6 @@ from typing import Any, TypeVar
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-
 T = TypeVar("T")
 
 

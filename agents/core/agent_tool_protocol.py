@@ -3,7 +3,6 @@ from typing import Any, Protocol
 from .protocol import FrameT
 from .utils import MISSING
 
-
 # Agent Tool frames sit outside MessageType and the cf_agent_* namespace. The client
 # deduplicates on (parentToolCallId, runId, sequence), so optional keys are omitted
 # rather than sent as null.

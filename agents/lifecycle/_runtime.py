@@ -8,7 +8,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, TypeGuard, cast, overload
+from typing import Any, Protocol, TypeGuard, cast, overload
 
 from js import Object, setTimeout  # ty: ignore[unresolved-import]
 from pyodide.ffi import create_once_callable, to_js
@@ -17,7 +17,7 @@ from workers import Request, Response
 from ..core._discovery import static_mro_members
 from ..core.utils import now_ms
 from ._job_driver import _JobDispatch, _LifecycleJobDriver
-from .capability import LifecycleCapability, _SERVICE_SLOT
+from .capability import _SERVICE_SLOT, LifecycleCapability
 from .host_context import (
     _CURRENT_LIFECYCLE_CONTEXT,
     _call_maybe_async,
@@ -56,8 +56,7 @@ from .types import (
     LifecycleStorage,
 )
 
-
-__all__ = [
+__all__ = (
     "CapabilityRequestContext",
     "CapabilityWebSocketCloseContext",
     "CapabilityWebSocketErrorContext",
@@ -87,7 +86,7 @@ __all__ = [
     "LifecycleSql",
     "LifecycleStorage",
     "get_current_lifecycle_context",
-]
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -103,16 +102,28 @@ _BUILTIN_CAPABILITY_IDS = (
 )
 
 
+class _RuntimeStorage(Protocol):
+    def get(self, key: object) -> object: ...
+    def put(self, *args: object) -> object: ...
+    def delete(self, key: object) -> object: ...
+    def list(self, options: object) -> object: ...
+    def transactionSync[T](self, callback: Callable[[], T]) -> T: ...
+
+
+class _StorageContext(Protocol):
+    storage: _RuntimeStorage
+
+
 class _StorageServices:
     __slots__ = ("_ctx", "_lifecycle")
 
     def __init__(self, lifecycle: Lifecycle, ctx: object):
         self._lifecycle = lifecycle
-        self._ctx = ctx
+        self._ctx = cast(_StorageContext, ctx)
 
     @property
-    def _storage(self) -> object:
-        return getattr(self._ctx, "storage")
+    def _storage(self) -> _RuntimeStorage:
+        return self._ctx.storage
 
     @overload
     async def get(self, key: str) -> Any: ...
@@ -124,7 +135,7 @@ class _StorageServices:
         async with self._lifecycle._operation(continue_existing=True):
             storage_key = key if type(key) is str else list(key)
             return await _call_maybe_async(
-                getattr(self._storage, "get"),
+                self._storage.get,
                 storage_key,
             )
 
@@ -140,7 +151,7 @@ class _StorageServices:
         value: object = _MISSING,
     ) -> None:
         async with self._lifecycle._operation(continue_existing=True):
-            put = getattr(self._storage, "put")
+            put = self._storage.put
             if value is _MISSING:
                 await _call_maybe_async(put, key)
             else:
@@ -156,7 +167,7 @@ class _StorageServices:
         async with self._lifecycle._operation(continue_existing=True):
             storage_key = key if type(key) is str else list(key)
             return await _call_maybe_async(
-                getattr(self._storage, "delete"),
+                self._storage.delete,
                 storage_key,
             )
 

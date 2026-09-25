@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from .protocol import stream_pending_frame, stream_resume_none_frame
 from ..lifecycle.websockets import Connection
+from .protocol import stream_pending_frame, stream_resume_none_frame
 
 
 class PreStreamTurns:

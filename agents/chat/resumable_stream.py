@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
-from .protocol import chat_response
 from ..core.utils import gen_id, now_ms
+from .protocol import chat_response
 
 SqlFn = Callable[..., list[dict[str, Any]]]
 
@@ -30,6 +30,7 @@ class StreamRecord:
     request_id: str
     status: StreamStatus
     message_id: str | None
+    is_continuation: bool = False
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class RecoverySnapshot:
 class TerminalRecord:
     request_id: str
     body: str
+    is_continuation: bool = False
 
 
 class StreamStorageUnavailable(RuntimeError):
@@ -105,6 +107,7 @@ class ResumableStream:
         self._active_request_id: str | None = None
         self._chunk_index = 0
         self._is_live = False
+        self._active_is_continuation = False
         self._chunk_buffer: list[tuple[str, str]] = []
         self._chunk_buffer_row_id: str | None = None
 
@@ -152,10 +155,19 @@ class ResumableStream:
             slot INTEGER PRIMARY KEY CHECK (slot = 1),
             request_id TEXT NOT NULL,
             body TEXT NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            is_continuation INTEGER
         )
         """)
         self._reconcile_metadata_columns()
+        terminal_columns = {
+            row["name"]
+            for row in self._strict_sql("PRAGMA table_info(cf_ai_chat_terminal)")
+        }
+        if "is_continuation" not in terminal_columns:
+            self._strict_sql(
+                "ALTER TABLE cf_ai_chat_terminal ADD COLUMN is_continuation INTEGER"
+            )
         self._strict_sql(
             "CREATE INDEX IF NOT EXISTS idx_stream_chunks_stream_id "
             "ON cf_ai_chat_stream_chunks(stream_id, chunk_index)"
@@ -185,16 +197,27 @@ class ResumableStream:
     def active_request_id(self) -> str | None:
         return self._active_request_id
 
+    @property
+    def active_is_continuation(self) -> bool:
+        return self._active_is_continuation
+
     def has_active_stream(self) -> bool:
         return self._active_stream_id is not None
 
-    def start(self, request_id: str, message_id: str | None = None) -> str:
+    def start(
+        self,
+        request_id: str,
+        message_id: str | None = None,
+        *,
+        continuation: bool = False,
+    ) -> str:
         self.flush_buffer()
         stream_id = gen_id()
         self._active_stream_id = stream_id
         self._active_request_id = request_id
         self._chunk_index = 0
         self._is_live = True
+        self._active_is_continuation = continuation
         wrote = self._try_sql(
             "INSERT INTO cf_ai_chat_stream_metadata "
             "(id, request_id, status, created_at, message_id, is_continuation) "
@@ -203,7 +226,7 @@ class ResumableStream:
             request_id,
             now_ms(),
             message_id,
-            0,
+            int(continuation),
         )
         if wrote is None:
             self._clear_active()
@@ -287,6 +310,10 @@ class ResumableStream:
     def mark_error(self, stream_id: str) -> None:
         self._finish(stream_id, StreamStatus.ERROR)
 
+    def cancel_request(self, request_id: str) -> None:
+        if self._active_request_id == request_id and self._active_stream_id is not None:
+            self.complete(self._active_stream_id)
+
     def _finish(self, stream_id: str, status: StreamStatus) -> None:
         self.flush_buffer()
         self._try_sql(
@@ -299,24 +326,38 @@ class ResumableStream:
         if self._active_stream_id == stream_id:
             self._clear_active()
 
-    def record_terminal_error(self, request_id: str, body: str) -> None:
+    def record_terminal_error(
+        self,
+        request_id: str,
+        body: str,
+        *,
+        continuation: bool = False,
+    ) -> None:
         self._try_sql(
-            "INSERT INTO cf_ai_chat_terminal (slot, request_id, body, created_at) "
-            "VALUES (1, ?, ?, ?) ON CONFLICT (slot) DO UPDATE SET "
+            "INSERT INTO cf_ai_chat_terminal "
+            "(slot, request_id, body, created_at, is_continuation) "
+            "VALUES (1, ?, ?, ?, ?) ON CONFLICT (slot) DO UPDATE SET "
             "request_id = excluded.request_id, body = excluded.body, "
-            "created_at = excluded.created_at",
+            "created_at = excluded.created_at, "
+            "is_continuation = excluded.is_continuation",
             request_id,
             body,
             now_ms(),
+            int(continuation),
         )
 
     def latest_terminal_error(self) -> TerminalRecord | None:
         rows = self._try_sql(
-            "SELECT request_id, body FROM cf_ai_chat_terminal WHERE slot = 1"
+            "SELECT request_id, body, is_continuation "
+            "FROM cf_ai_chat_terminal WHERE slot = 1"
         )
         if not rows:
             return None
-        return TerminalRecord(rows[0]["request_id"], rows[0]["body"])
+        return TerminalRecord(
+            rows[0]["request_id"],
+            rows[0]["body"],
+            bool(rows[0].get("is_continuation")),
+        )
 
     def clear_terminal_error(self) -> None:
         self._try_sql("DELETE FROM cf_ai_chat_terminal")
@@ -325,11 +366,16 @@ class ResumableStream:
         stream_id = self._active_stream_id
         if stream_id is None:
             return
-        replay = self._replay_rows(connection, stream_id, request_id)
+        continuation = self._active_is_continuation
+        replay = self._replay_rows(connection, stream_id, request_id, continuation)
         if replay == _ReplayResult.READ_FAILED:
             if not self._is_live:
                 self.mark_error(stream_id)
-            self._send_replay_failure(connection, request_id)
+            self._send_replay_failure(
+                connection,
+                request_id,
+                continuation=continuation,
+            )
             return
         if replay == _ReplayResult.CLOSED:
             return
@@ -341,36 +387,61 @@ class ResumableStream:
                     done=False,
                     replay=True,
                     replay_complete=True,
+                    continuation=continuation,
                 )
             )
             return
         connection.send_if_open(
-            chat_response(self._response_type, request_id, done=True, replay=True)
+            chat_response(
+                self._response_type,
+                request_id,
+                done=True,
+                replay=True,
+                continuation=continuation,
+            )
         )
         self.complete(stream_id)
 
     def replay_completed_chunks(self, connection: _Sendable, request_id: str) -> bool:
-        stream_id = self._latest_stream_id_for_status(
-            request_id, StreamStatus.COMPLETED
-        )
-        if stream_id is None:
+        stream = self._latest_stream_for_status(request_id, StreamStatus.COMPLETED)
+        if stream is None:
             return False
-        replay = self._replay_rows(connection, stream_id, request_id)
+        replay = self._replay_rows(
+            connection,
+            stream.stream_id,
+            request_id,
+            stream.is_continuation,
+        )
         if replay == _ReplayResult.READ_FAILED:
-            self._send_replay_failure(connection, request_id)
+            self._send_replay_failure(
+                connection,
+                request_id,
+                continuation=stream.is_continuation,
+            )
             return True
         if replay == _ReplayResult.CLOSED:
             return True
         connection.send_if_open(
-            chat_response(self._response_type, request_id, done=True, replay=True)
+            chat_response(
+                self._response_type,
+                request_id,
+                done=True,
+                replay=True,
+                continuation=stream.is_continuation,
+            )
         )
         return True
 
     def replay_error_chunks(self, connection: _Sendable, request_id: str) -> bool:
-        stream_id = self._latest_stream_id_for_status(request_id, StreamStatus.ERROR)
-        if stream_id is None:
+        stream = self._latest_stream_for_status(request_id, StreamStatus.ERROR)
+        if stream is None:
             return False
-        self._replay_rows(connection, stream_id, request_id)
+        self._replay_rows(
+            connection,
+            stream.stream_id,
+            request_id,
+            stream.is_continuation,
+        )
         return True
 
     def _replay_rows(
@@ -378,6 +449,7 @@ class ResumableStream:
         connection: _Sendable,
         stream_id: str,
         request_id: str,
+        continuation: bool,
     ) -> _ReplayResult:
         cursor = (-1, 0)
         while True:
@@ -393,6 +465,7 @@ class ResumableStream:
                             body,
                             done=False,
                             replay=True,
+                            continuation=continuation,
                         )
                     ):
                         return _ReplayResult.CLOSED
@@ -400,12 +473,19 @@ class ResumableStream:
                 return _ReplayResult.SENT
             cursor = (int(rows[-1]["chunk_index"]), int(rows[-1]["row_id"]))
 
-    def _send_replay_failure(self, connection: _Sendable, request_id: str) -> None:
+    def _send_replay_failure(
+        self,
+        connection: _Sendable,
+        request_id: str,
+        *,
+        continuation: bool = False,
+    ) -> None:
         frame = chat_response(
             self._response_type,
             request_id,
             "Unable to replay the retained chat stream",
             done=True,
+            continuation=continuation,
         )
         frame["error"] = True
         connection.send_if_open(frame)
@@ -440,7 +520,7 @@ class ResumableStream:
 
     def latest_for_request(self, request_id: str) -> StreamRecord | None:
         rows = self._strict_sql(
-            "SELECT id, request_id, status, message_id FROM "
+            "SELECT id, request_id, status, message_id, is_continuation FROM "
             "cf_ai_chat_stream_metadata WHERE request_id = ? "
             "ORDER BY created_at DESC, rowid DESC LIMIT 1",
             request_id,
@@ -461,7 +541,7 @@ class ResumableStream:
             where += " AND message_id = ?"
             params.append(message_id)
         rows = self._strict_sql(
-            "SELECT id, request_id, status, message_id FROM "
+            "SELECT id, request_id, status, message_id, is_continuation FROM "
             f"cf_ai_chat_stream_metadata WHERE {where} "
             "ORDER BY created_at DESC, rowid DESC LIMIT 1",
             *params,
@@ -472,12 +552,13 @@ class ResumableStream:
         bodies: list[str] = []
         total_bytes = 0
         for body in self._strict_bodies(stream.stream_id):
+            body_bytes = _utf8_len(body)
+            if max_chunks is not None and len(bodies) >= max_chunks:
+                return RecoverySnapshot(stream, tuple(bodies), limit_exceeded=True)
+            if max_bytes is not None and total_bytes + body_bytes > max_bytes:
+                return RecoverySnapshot(stream, tuple(bodies), limit_exceeded=True)
             bodies.append(body)
-            total_bytes += _utf8_len(body)
-            if max_chunks is not None and len(bodies) > max_chunks:
-                return RecoverySnapshot(stream, (), limit_exceeded=True)
-            if max_bytes is not None and total_bytes > max_bytes:
-                return RecoverySnapshot(stream, (), limit_exceeded=True)
+            total_bytes += body_bytes
         return RecoverySnapshot(stream, tuple(bodies))
 
     def completed_bodies_for_request(
@@ -525,15 +606,17 @@ class ResumableStream:
             request_id=row["request_id"],
             status=status,
             message_id=row["message_id"],
+            is_continuation=bool(row.get("is_continuation")),
         )
 
-    def _latest_stream_id_for_status(
+    def _latest_stream_for_status(
         self,
         request_id: str,
         status: StreamStatus,
-    ) -> str | None:
+    ) -> StreamRecord | None:
         rows = self._try_sql(
-            "SELECT id FROM cf_ai_chat_stream_metadata "
+            "SELECT id, request_id, status, message_id, is_continuation "
+            "FROM cf_ai_chat_stream_metadata "
             "WHERE request_id = ? AND status = ? "
             "ORDER BY created_at DESC, rowid DESC LIMIT 1",
             request_id,
@@ -541,11 +624,11 @@ class ResumableStream:
         )
         if not rows:
             return None
-        return rows[0]["id"]
+        return self._record(rows[0])
 
     def _restore(self) -> None:
         rows = self._strict_sql(
-            "SELECT id, request_id FROM cf_ai_chat_stream_metadata "
+            "SELECT id, request_id, is_continuation FROM cf_ai_chat_stream_metadata "
             "WHERE status = 'streaming' "
             "ORDER BY created_at DESC, rowid DESC LIMIT 1"
         )
@@ -553,6 +636,7 @@ class ResumableStream:
             return
         self._active_stream_id = rows[0]["id"]
         self._active_request_id = rows[0]["request_id"]
+        self._active_is_continuation = bool(rows[0].get("is_continuation"))
         self._is_live = False
         max_rows = self._strict_sql(
             "SELECT MAX(chunk_index) AS max_index "
@@ -589,6 +673,7 @@ class ResumableStream:
         self._active_request_id = None
         self._chunk_index = 0
         self._is_live = False
+        self._active_is_continuation = False
 
     def next_cleanup_deadline(self) -> int | None:
         rows = self._try_sql(

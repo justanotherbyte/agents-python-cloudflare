@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Literal, NotRequired, TypeVar, TypedDict, cast
+from typing import Any, Literal, NotRequired, TypedDict, TypeVar, cast
 from urllib.parse import quote
 
 from .core._discovery import (
@@ -39,6 +39,8 @@ from .lifecycle.jobs import (
     LifecycleJobPushOptions,
     LifecycleJobReschedule,
     LifecycleMemoryLimitContext,
+)
+from .lifecycle.jobs import (
     _validate_retry as _validate_lifecycle_retry,
 )
 

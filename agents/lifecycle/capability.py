@@ -20,7 +20,6 @@ from .types import (
     LifecycleServices,
 )
 
-
 _SERVICE_BINDING = "_agents_lifecycle_services"
 
 

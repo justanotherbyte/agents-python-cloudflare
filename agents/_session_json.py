@@ -8,7 +8,6 @@ from typing import cast
 
 from .core._wire import strict_json_loads
 
-
 _MAX_EXACT_INTEGER = 2**53
 _MAX_ARRAY_INDEX = 2**32 - 2
 

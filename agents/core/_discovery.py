@@ -5,7 +5,6 @@ from collections.abc import Callable
 from types import FunctionType, GetSetDescriptorType
 from typing import Any, cast
 
-
 _TYPE_NAMESPACE = cast(GetSetDescriptorType, type.__dict__["__dict__"])
 _TYPE_MRO = cast(GetSetDescriptorType, type.__dict__["__mro__"])
 

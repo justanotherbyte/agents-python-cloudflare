@@ -419,7 +419,7 @@ def test_recovery_snapshot_stops_at_chunk_limit(sql):
     )
     assert snapshot is not None
     assert snapshot.limit_exceeded is True
-    assert snapshot.bodies == ()
+    assert snapshot.bodies == ("one", "two")
 
 
 def test_recovery_snapshot_stops_at_utf8_byte_limit(sql):
@@ -569,3 +569,26 @@ def test_cleanup_never_reaps_the_live_active_stream(sql):
         "SELECT id FROM cf_ai_chat_stream_metadata WHERE id = ?",
         stream_id,
     ) == [{"id": stream_id}]
+
+
+def test_continuation_marker_survives_reincarnation_and_replay(sql):
+    stream = _stream(sql)
+    stream_id = stream.start("request", "message", continuation=True)
+    stream.store_chunk(stream_id, "partial")
+
+    reincarnated = _stream(sql)
+    connection = fakes.FakeConnection()
+    reincarnated.replay_active_chunks(connection, "request")
+
+    assert connection.frames
+    assert all(frame["continuation"] is True for frame in connection.frames)
+
+
+def test_terminal_error_retains_continuation_marker(sql):
+    stream = _stream(sql)
+    stream.record_terminal_error("request", "failed", continuation=True)
+
+    terminal = _stream(sql).latest_terminal_error()
+
+    assert terminal is not None
+    assert terminal.is_continuation is True

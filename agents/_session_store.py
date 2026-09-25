@@ -7,17 +7,16 @@ from typing import Literal, cast
 from uuid import uuid4
 
 from ._session_attachments import (
-    _PendingAttachment,
-    _StoredAttachment,
     _attachment_hashes,
     _extract_attachments,
+    _PendingAttachment,
     _resolve_attachments,
+    _StoredAttachment,
 )
-from ._session_json import dumps_session_json, parse_session_message
 from ._session_compaction import _StoredCompaction
+from ._session_json import dumps_session_json, parse_session_message
 from .core.utils import now_ms
 from .lifecycle import LifecycleSql
-
 
 _MAX_PATH_DEPTH = 10_000
 _MAX_INLINE_ROW_BYTES = 1536 * 1024

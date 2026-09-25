@@ -57,6 +57,7 @@ def test_agent_binds_default_capabilities_to_one_lifecycle():
 
     assert agent._lifecycle._bound_lifecycle(agent.scheduler) is agent._lifecycle
     assert agent._lifecycle._bound_lifecycle(agent.tasks) is agent._lifecycle
+    assert agent._lifecycle._bound_lifecycle(agent.mcp) is agent._lifecycle
     assert agent._lifecycle._bound_lifecycle(agent._websockets) is agent._lifecycle
     assert agent._lifecycle._bound_lifecycle(agent._fiber) is agent._lifecycle
     assert [item.capability for item in agent._lifecycle._fallbacks] == [
@@ -65,6 +66,7 @@ def test_agent_binds_default_capabilities_to_one_lifecycle():
     assert agent._lifecycle._seal_registrations() == (
         agent.scheduler,
         agent.tasks,
+        agent.mcp,
         agent._fiber,
         agent._websockets,
     )
@@ -270,7 +272,7 @@ async def test_facet_recovery_stays_gated_without_root_maintenance():
 
 
 @pytest.mark.asyncio
-async def test_facet_chat_turn_does_not_request_a_local_alarm():
+async def test_unconfigured_facet_chat_turn_does_not_request_a_local_alarm():
     replies = []
 
     def reply(_options):
@@ -300,12 +302,12 @@ async def test_facet_chat_turn_does_not_request_a_local_alarm():
         {"id": "request", "init": {"method": "POST", "body": body}},
     )
 
-    assert replies == ["called"]
+    assert replies == []
     assert any(
         frame.get("type") == ChatMessageType.USE_CHAT_RESPONSE
         and frame.get("id") == "request"
         and frame.get("done") is True
-        and frame.get("body") == ""
+        and frame.get("error") is True
         for frame in connection.frames
     )
     assert (

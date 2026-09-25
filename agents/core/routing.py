@@ -8,7 +8,6 @@ from workers import Request, Response
 from .error import RoutingException
 from .utils import url_path
 
-
 CorsT = bool | dict[str, str] | None
 
 _CAMEL_BOUNDARY_REGEX = re.compile(r"[A-Z]")

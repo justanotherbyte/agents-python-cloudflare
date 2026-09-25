@@ -74,6 +74,63 @@ async def test_successful_turn_emits_start_chunks_and_clean_terminal():
 
 
 @pytest.mark.asyncio
+async def test_cancel_emits_exactly_one_terminal():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def provider(_options):
+        async def chunks():
+            yield "partial"
+            started.set()
+            await release.wait()
+
+        return chunks()
+
+    agent = fakes.build_chat_agent(provider)
+    connection = fakes.FakeConnection()
+    agent._connections[connection.id] = connection
+    request = asyncio.create_task(
+        agent._handle_use_chat_request(
+            connection,
+            _use_chat_request("cancelled", _valid_body()),
+        )
+    )
+    await started.wait()
+
+    await agent._handle_cancel({"id": "cancelled"})
+    release.set()
+    await asyncio.gather(request, return_exceptions=True)
+
+    assert len(_terminals(connection, "cancelled")) == 1
+    assert agent._resumable.has_active_stream() is False
+
+
+@pytest.mark.asyncio
+async def test_opt_in_provider_stall_watchdog_terminalizes_the_turn():
+    async def provider(_options):
+        async def chunks():
+            await asyncio.Event().wait()
+            yield "unreachable"
+
+        return chunks()
+
+    agent = fakes.build_chat_agent(provider)
+    agent.chat_provider_stall_timeout_ms = 1
+    connection = fakes.FakeConnection()
+    agent._connections[connection.id] = connection
+
+    await agent._handle_use_chat_request(
+        connection,
+        _use_chat_request("stalled", _valid_body()),
+    )
+
+    assert len(_terminals(connection, "stalled")) == 1
+    assert _terminals(connection, "stalled")[0]["body"] == (
+        "Chat provider stream stalled"
+    )
+
+
+@pytest.mark.asyncio
 async def test_error_mid_turn_broadcasts_error_terminal_and_does_not_offer_resume():
     def boom(_options):
         raise RuntimeError("boom")

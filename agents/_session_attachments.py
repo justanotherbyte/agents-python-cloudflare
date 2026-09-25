@@ -7,7 +7,6 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
-
 _ATTACHMENT_PREFIX = "attachment:sha256:"
 _MAX_WALK_DEPTH = 8
 _BASE64 = re.compile(r"[A-Za-z0-9+/]*={0,2}")

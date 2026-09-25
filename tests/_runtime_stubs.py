@@ -103,6 +103,10 @@ class _StubDurableObject:
         self.env = env
 
 
+class _StubWorkflowEntrypoint(_StubDurableObject):
+    pass
+
+
 class _StubHeaders(dict[str, str]):
     def __init__(self, headers: Any = None) -> None:
         super().__init__()
@@ -254,6 +258,7 @@ def install() -> None:
     workers = types.ModuleType("workers")
     setattr(workers, "_agents_stub", True)
     setattr(workers, "DurableObject", _StubDurableObject)
+    setattr(workers, "WorkflowEntrypoint", _StubWorkflowEntrypoint)
     setattr(workers, "Request", _StubRequest)
     setattr(workers, "Response", _StubResponse)
     setattr(workers, "waitUntil", _default_wait_until)

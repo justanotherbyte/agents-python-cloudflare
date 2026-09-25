@@ -7,7 +7,6 @@ from typing import Any
 
 from .types import CurrentLifecycleContext
 
-
 _CURRENT_LIFECYCLE_CONTEXT: ContextVar[CurrentLifecycleContext | None] = ContextVar(
     "agents_current_lifecycle_context",
     default=None,
@@ -18,6 +17,7 @@ def get_current_lifecycle_context() -> CurrentLifecycleContext | None:
     return _CURRENT_LIFECYCLE_CONTEXT.get()
 
 
+# TODO: this exists in utils.py if not make a utility for this
 async def _call_maybe_async(callback: Callable[..., Any], *args: object) -> Any:
     result = callback(*args)
     if inspect.isawaitable(result):

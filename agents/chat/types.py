@@ -18,11 +18,16 @@ class ChatOptions:
         trigger: str,
         body: dict[str, Any],
         abort: asyncio.Event,
+        *,
+        continuation: bool = False,
+        client_tools: list[Any] | None = None,
     ):
         self.request_id = request_id
         self.trigger = trigger
         self.body = body
         self.abort = abort
+        self.continuation = continuation
+        self.client_tools = client_tools
 
     @property
     def aborted(self) -> bool:

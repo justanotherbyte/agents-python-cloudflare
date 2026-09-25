@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable, MutableMapping
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Protocol, TypedDict
+from typing import Any, NotRequired, Protocol, TypedDict
 
 from .connection_state import (
     connection_state_flags,
@@ -16,9 +16,15 @@ from .connection_state import (
 from .utils import dumps_wire
 
 
+class RelayPathStep(TypedDict):
+    className: str
+    name: str
+
+
 class RelayTarget(TypedDict):
     url: str
     headers: dict[str, str]
+    path: NotRequired[list[RelayPathStep]]
 
 
 class RelayLimitError(RuntimeError):
@@ -81,12 +87,14 @@ class BufferedRelayConnection:
         self,
         connection_id: str,
         *,
+        physical_key: str | None = None,
         state: Any,
         tags: list[str],
         max_frames: int,
         max_bytes: int,
     ) -> None:
         self.id = connection_id
+        self._physical_key = physical_key
         self._state = deepcopy(state)
         self._tags = list(tags)
         self._limits = RelayLimits(max_frames, max_bytes)

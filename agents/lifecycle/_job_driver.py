@@ -18,7 +18,6 @@ from .jobs import (
     _validate_retry,
 )
 
-
 _DEADMAN_DELAY_MS = 30_000
 _DEFAULT_RETRY = {
     "maxAttempts": 3,

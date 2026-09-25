@@ -5,7 +5,6 @@ from collections.abc import Mapping, Sequence
 
 from ._session_json import dumps_session_json
 
-
 _MAX_DEPTH = 8
 _TRUNCATED_FLAG = "__truncated"
 _TRUNCATED_CHARS = "__truncatedChars"

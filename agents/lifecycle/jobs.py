@@ -9,7 +9,6 @@ from typing import Any, Literal, Protocol
 from ..core._wire import strict_json_loads
 from ..core.utils import MISSING, dumps_wire, gen_id
 
-
 type _SqlExecutor = Callable[..., list[dict[str, Any]]]
 type LifecycleJobOutcome = LifecycleJobReschedule | Literal["yield"] | None
 
@@ -424,22 +423,23 @@ class _LifecycleJobQueue:
         raise ValueError(f"invalid job outcome for {row['id']}")
 
     def next_alarm_time(self, time: int) -> int | None:
+        # SqlStorage rejects the SQLite maximum when FFI converts its bind to BigInt.
+        time_upper_bound = _MAX_SQLITE_INTEGER
         exclusive_time = self._valid_exclusive_time()
         if exclusive_time is not None:
             ready = self._sql(
-                """
+                f"""
                 SELECT MIN(time) AS time FROM cf_agents_jobs
                 WHERE exclusive = 1
                   AND (singleflight = 0
                     OR running = 0
                     OR coalesce(execution_started_at, 0)
                        + coalesce(hung_timeout_seconds, ?) * 1000 <= ?)
-                  AND typeof(time) IN ('integer', 'real')
-                  AND time BETWEEN 0 AND ?
+                   AND typeof(time) IN ('integer', 'real')
+                   AND time BETWEEN 0 AND {time_upper_bound}
                 """,
                 _DEFAULT_HUNG_TIMEOUT_SECONDS,
                 time,
-                _MAX_SQLITE_INTEGER,
             )
             ready_time = ready[0]["time"] if ready else None
             candidate = int(ready_time) if ready_time is not None else None
@@ -468,18 +468,17 @@ class _LifecycleJobQueue:
             return candidate
 
         ready = self._sql(
-            """
+            f"""
             SELECT MIN(time) AS time FROM cf_agents_jobs
             WHERE (singleflight = 0
                OR running = 0
                OR coalesce(execution_started_at, 0)
                   + coalesce(hung_timeout_seconds, ?) * 1000 <= ?)
               AND typeof(time) IN ('integer', 'real')
-              AND time BETWEEN 0 AND ?
+              AND time BETWEEN 0 AND {time_upper_bound}
             """,
             _DEFAULT_HUNG_TIMEOUT_SECONDS,
             time,
-            _MAX_SQLITE_INTEGER,
         )
         ready_time = ready[0]["time"] if ready else None
         candidate = max(int(ready_time), time + 1) if ready_time is not None else None

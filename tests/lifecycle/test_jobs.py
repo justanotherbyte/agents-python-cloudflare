@@ -7,6 +7,7 @@ import fakes
 import pytest
 
 import agents.lifecycle._runtime as lifecycle_module
+import agents.lifecycle.jobs as jobs_module
 from agents.lifecycle import (
     Lifecycle,
     LifecycleCapability,
@@ -33,6 +34,26 @@ EXPECTED_COLUMNS = [
 
 class WorkerCapability(LifecycleCapability):
     capability_id = "worker"
+
+
+def test_alarm_candidate_only_binds_javascript_safe_integers():
+    queries = []
+
+    def sql(query, *params):
+        queries.append(query)
+        assert all(
+            not isinstance(value, int) or abs(value) <= 2**53 - 1 for value in params
+        )
+        if "SELECT *" in query:
+            return []
+        return [{"time": None}] if "AS time" in query else [{"recheck": None}]
+
+    queue = jobs_module._LifecycleJobQueue(sql)
+
+    assert queue.next_alarm_time(1_000) is None
+    assert "9223372036854775807" in next(
+        query for query in queries if "AS time" in query
+    )
 
 
 @pytest.mark.asyncio

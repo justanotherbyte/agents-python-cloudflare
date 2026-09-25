@@ -19,11 +19,11 @@ from typing import Literal, NotRequired, TypedDict, cast
 
 from ._session_compaction import (
     _COMPACTION_PREFIX,
-    _StoredCompaction,
     _build_summary_prompt,
     _overlay_message,
     _plan_overlays,
     _prepare_compaction_input,
+    _StoredCompaction,
 )
 from ._session_json import (
     clone_session_json,
@@ -34,7 +34,6 @@ from ._session_store import _SessionPathRow, _SessionStore
 from .core.schema import parse_schema_version
 from .core.utils import MISSING
 from .lifecycle import LifecycleCapability
-
 
 _LOGGER = logging.getLogger(__name__)
 

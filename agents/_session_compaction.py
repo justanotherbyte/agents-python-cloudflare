@@ -7,7 +7,6 @@ from datetime import UTC, datetime
 
 from ._session_json import dumps_session_json
 
-
 _COMPACTION_PREFIX = "compaction_"
 _PROTECT_HEAD = 3
 _MIN_TAIL_MESSAGES = 2
@@ -269,6 +268,7 @@ def _format_tool(part: Mapping[str, object]) -> str:
     return "\n".join(lines)
 
 
+# TODO: move to utils.py
 def _js_truthy(value: object) -> bool:
     if value is None or value is False:
         return False
@@ -279,6 +279,7 @@ def _js_truthy(value: object) -> bool:
     return not isinstance(value, str) or bool(value)
 
 
+# TODO: move to utils.py
 def _js_string(value: object) -> str:
     if value is None:
         return "null"
@@ -295,6 +296,7 @@ def _js_string(value: object) -> str:
     return "[object Object]"
 
 
+# TODO: move to utils.py
 def _slice_utf16(value: str, units: int) -> str:
     encoded = value.encode("utf-16-le", errors="surrogatepass")
     return encoded[: units * 2].decode("utf-16-le", errors="surrogatepass")

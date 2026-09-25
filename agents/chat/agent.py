@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import math
 from collections.abc import Callable, Iterable
 from contextlib import suppress
-from typing import Any
+from contextvars import ContextVar
+from typing import Any, cast
 
 from js import Object, ReadableStream, TextEncoder  # ty: ignore[unresolved-import]
 from pyodide.ffi import create_proxy, to_js
@@ -21,11 +23,12 @@ from ..core.utils import (
     now_ms,
     url_path,
 )
-from ..lifecycle._job_driver import _is_platform_failure
-from ..lifecycle.fiber import INTERNAL_FIBER_PREFIX, FiberRecoveryContext
-from ..lifecycle.websockets import Connection
+from ..lifecycle._job_driver import _is_memory_limit_reset, _is_platform_failure
+from ..lifecycle.websockets import Connection, ConnectionContext
 from ..sessions import Session, SessionChangeEvent, Sessions
+from ..tasks import TaskStep, TaskStepConfig, TaskStepRetryOptions
 from .agent_tools import ChildAgentToolRuns
+from .continuation import AutoContinuationController, ContinuationRequest
 from .folding import (
     TOOL_RESOLVED_STATES,
     MessageAccumulator,
@@ -52,6 +55,17 @@ from .protocol import (
     stream_resuming_frame,
 )
 from .resumable_stream import ResumableStream, StreamStatus, StreamStorageUnavailable
+from .recovery import (
+    CHAT_RECOVERING_KEY,
+    CHAT_RECOVERING_FLAG_TTL_MS,
+    CHAT_RECOVERY_INCIDENT_TTL_MS,
+    CHAT_RECOVERY_INCIDENT_KEY_PREFIX,
+    CHAT_RECOVERY_PROGRESS_KEY,
+    RecoveryPolicy,
+    evaluate_incident,
+    incident_id,
+    incident_key,
+)
 from .turn_queue import TurnContext, TurnQueue
 from .types import ChatOptions, ChatReplyT, ChunkT, MessageT
 
@@ -74,10 +88,16 @@ _TOOL_RESULT_FROM = (
 _TOOL_PART_ATTEMPTS = 10
 _TOOL_PART_RETRY_S = 0.1
 
-_CHAT_FIBER_PREFIX = f"{INTERNAL_FIBER_PREFIX}chat_turn:"
+_CHAT_TURN_TASK = "__cf_internal_chat_turn"
+_CHAT_RECOVERY_TASK = "__cf_internal_chat_recovery"
+_CHAT_TASK_RUN_PREFIX = "chat_"
 _CHAT_RECOVERY_VERSION = 1
 _LEGACY_LIFT_WINDOW_ROWS = 25
 _LEGACY_LIFT_WINDOW_BYTES = 4 * 1024 * 1024
+_TOOL_INTERACTION_CONNECTION: ContextVar[Connection | None] = ContextVar(
+    "chat_tool_interaction_connection",
+    default=None,
+)
 
 
 class AIChatAgent(Agent):
@@ -87,12 +107,25 @@ class AIChatAgent(Agent):
     durable_chat_recovery = False
     chat_recovery_max_chunks = 10_000
     chat_recovery_max_bytes = 16 * 1024 * 1024
+    chat_recovery_max_attempts = 10
+    chat_recovery_no_progress_timeout_ms = 5 * 60 * 1000
+    chat_recovery_max_work = 1_000
+    chat_recovery_max_oom_retries = 3
+    chat_recovery_retry_delay_seconds = 3
+    chat_recovery_stable_timeout_ms = 10_000
+    chat_recovery_acceptance_attempts = 3
+    chat_provider_stall_timeout_ms: int | None = None
+    chat_recovery_terminal_message = (
+        "The assistant was interrupted and could not recover. Please try again."
+    )
     hydration_byte_budget: int | float = 32 * 1024 * 1024
 
     def __init__(self, ctx, env):
         super().__init__(ctx, env)
 
         self._aborts: dict[str, asyncio.Event] = {}
+        self._request_task_runs: dict[str, str] = {}
+        self._live_chat_turns: dict[str, Callable[[], Any]] = {}
         self._turn_queue = TurnQueue()
 
         # Held out of the live broadcast until they ACK, so the buffer replay and the
@@ -106,6 +139,9 @@ class AIChatAgent(Agent):
         # turn ends this is the only place that message exists.
         self._streaming_message: MessageT | None = None
         self._interaction_lock = asyncio.Lock()
+        self._pending_interactions = 0
+        self._interactions_idle = asyncio.Event()
+        self._interactions_idle.set()
         self._migration_lock = asyncio.Lock()
         self.messages: list[MessageT] = []
         self._messages_truncated = False
@@ -126,6 +162,28 @@ class AIChatAgent(Agent):
             self.run_agent_tool_turn,
             self.collect_agent_tool_result,
         )
+        self.tasks._register_reserved_definition(
+            _CHAT_TURN_TASK,
+            self._chat_turn_task,
+        )
+        self.tasks._register_reserved_definition(
+            _CHAT_RECOVERY_TASK,
+            self._chat_recovery_task,
+        )
+        self._continuation = AutoContinuationController(
+            generate_request_id=gen_id,
+            is_stream_active=lambda: self._streaming_message is not None,
+            has_pending_interaction=lambda: self._pending_interactions > 0,
+            has_incomplete_tool_batch=self._has_incomplete_tool_batch,
+            drain_interactions=self._drain_interactions,
+            fire=self._fire_auto_continuation,
+            spawn=self._spawn_continuation,
+        )
+        self._last_body: dict[str, Any] = {}
+        self._last_client_tools: list[Any] | None = None
+        self._last_progress_bump_at = 0
+        self._terminal_request_ids: set[str] = set()
+        self._continuation_request_ids: set[str] = set()
 
     # -- storage ---------------------------------------------------------
 
@@ -136,12 +194,51 @@ class AIChatAgent(Agent):
     def _prepare_chat_storage(self) -> None:
         self._resumable.prepare()
         self._child_agent_tool_runs.prepare()
+        self.sql("""
+        CREATE TABLE IF NOT EXISTS cf_ai_chat_request_context (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """)
+        self._restore_request_context()
+
+    def _restore_request_context(self) -> None:
+        for row in self.sql("SELECT key, value FROM cf_ai_chat_request_context"):
+            try:
+                value = json.loads(row["value"])
+            except (TypeError, ValueError):
+                continue
+            if row["key"] == "lastBody" and isinstance(value, dict):
+                self._last_body = value
+            elif row["key"] == "lastClientTools" and isinstance(value, list):
+                self._last_client_tools = value
+
+    def _persist_request_context(self) -> None:
+        self.sql(
+            "INSERT OR REPLACE INTO cf_ai_chat_request_context (key, value) "
+            "VALUES ('lastBody', ?)",
+            dumps_wire(self._last_body),
+        )
+        if self._last_client_tools is None:
+            self.sql(
+                "DELETE FROM cf_ai_chat_request_context WHERE key = 'lastClientTools'"
+            )
+        else:
+            self.sql(
+                "INSERT OR REPLACE INTO cf_ai_chat_request_context (key, value) "
+                "VALUES ('lastClientTools', ?)",
+                dumps_wire(self._last_client_tools),
+            )
+
+    def _clear_request_context(self) -> None:
+        self._last_body = {}
+        self._last_client_tools = None
+        self.sql("DELETE FROM cf_ai_chat_request_context")
 
     async def _lifecycle_host_start(self) -> None:
         await self._migrate_legacy_messages()
         await self._hydrate_messages()
         self._chat_startup_complete = True
-        await self._fiber.resume_deferred_recovery(self._is_chat_fiber)
         await super()._lifecycle_host_start()
 
     async def _migrate_legacy_messages(self) -> bool:
@@ -264,7 +361,6 @@ class AIChatAgent(Agent):
                 and await self._migrate_legacy_messages()
             ):
                 await self._hydrate_messages()
-                await self._fiber.resume_deferred_recovery(self._is_chat_fiber)
         if self._legacy_migration_incomplete:
             raise RuntimeError("legacy chat migration incomplete")
 
@@ -644,39 +740,40 @@ class AIChatAgent(Agent):
         tool_call_id: str,
         match_states: tuple[str, ...],
         update: Callable[[ChunkT], bool],
-    ) -> None:
+    ) -> bool:
         await self._ensure_chat_storage_ready()
         async with self._interaction_lock:
             message = await self._find_tool_message(tool_call_id)
             if message is None:
-                return
+                return False
 
             part = _find_tool_part(message["parts"], tool_call_id)
             if part is None or part.get("state") not in match_states:
                 # Already answered. A client retrying and a provider replaying both land
                 # here, and the first answer is the one that stands, so this is a quiet
                 # no-op rather than an error.
-                return
+                return False
 
             if message is self._streaming_message:
                 # Settled in place: the turn writes this message out when it ends, so
                 # there is nothing to persist here.
                 if update(part):
                     self.broadcast_json(message_updated_frame(message))
-                return
+                    return True
+                return False
 
-            await self._commit_tool_part(message, part, update)
+            return await self._commit_tool_part(message, part, update)
 
     async def _commit_tool_part(
         self,
         message: MessageT,
         part: ChunkT,
         update: Callable[[ChunkT], bool],
-    ) -> None:
+    ) -> bool:
         parts = message.get("parts") or []
         candidate = dict(part)
         if not update(candidate):
-            return
+            return False
 
         updated = {**message, "parts": [candidate if p is part else p for p in parts]}
 
@@ -687,10 +784,11 @@ class AIChatAgent(Agent):
         dumps_wire(updated)
         stored = await self._session.update_message(updated)
         if stored is None:
-            return
+            return False
         persisted = _transform_message(stored)
         if persisted is not None:
             self.broadcast_json(message_updated_frame(persisted))
+        return True
 
     async def _handle_tool_result(self, data: dict[str, Any]) -> None:
         tool_call_id = data.get("toolCallId")
@@ -702,9 +800,21 @@ class AIChatAgent(Agent):
         errored = data.get("state") == "output-error"
         error_text = data.get("errorText")
         output = data.get("output")
+        duplicate_matched = False
 
         def update(part: ChunkT) -> bool:
+            nonlocal duplicate_matched
             if part.get("state") in TOOL_RESOLVED_STATES:
+                duplicate_matched = (
+                    part.get("state") == "output-error"
+                    and errored
+                    and part.get("errorText")
+                    == (error_text or "Tool execution denied by user")
+                ) or (
+                    part.get("state") == "output-available"
+                    and not errored
+                    and part.get("output") == output
+                )
                 return False
 
             if errored:
@@ -716,7 +826,16 @@ class AIChatAgent(Agent):
                 part["preliminary"] = False
             return True
 
-        await self._apply_to_tool_part(tool_call_id, _TOOL_RESULT_FROM, update)
+        await self._apply_tool_interaction(
+            _TOOL_INTERACTION_CONNECTION.get(),
+            data,
+            lambda: self._apply_to_tool_part(
+                tool_call_id,
+                _TOOL_RESULT_FROM,
+                update,
+            ),
+            duplicate_matched=lambda: duplicate_matched,
+        )
 
     async def _handle_tool_approval(self, data: dict[str, Any]) -> None:
         tool_call_id = data.get("toolCallId")
@@ -741,7 +860,84 @@ class AIChatAgent(Agent):
             part["approval"] = {**existing, "id": approval_id, "approved": approved}
             return True
 
-        await self._apply_to_tool_part(tool_call_id, _TOOL_APPROVAL_FROM, update)
+        await self._apply_tool_interaction(
+            _TOOL_INTERACTION_CONNECTION.get(),
+            data,
+            lambda: self._apply_to_tool_part(
+                tool_call_id,
+                _TOOL_APPROVAL_FROM,
+                update,
+            ),
+        )
+
+    async def _apply_tool_interaction(
+        self,
+        connection: Connection | None,
+        data: dict[str, Any],
+        apply: Callable[[], Any],
+        duplicate_matched: Callable[[], bool] | None = None,
+    ) -> None:
+        self._pending_interactions += 1
+        self._interactions_idle.clear()
+        try:
+            applied = await apply()
+        finally:
+            self._pending_interactions -= 1
+            if self._pending_interactions == 0:
+                self._interactions_idle.set()
+        if not applied and not (duplicate_matched is not None and duplicate_matched()):
+            return
+        if data.get("autoContinue") is True and connection is not None:
+            body = data.get("body")
+            client_tools = data.get("clientTools")
+            continuation_body = (
+                copy.deepcopy(body) if isinstance(body, dict) else dict(self._last_body)
+            )
+            continuation_tools = (
+                copy.deepcopy(client_tools)
+                if isinstance(client_tools, list)
+                else copy.deepcopy(self._last_client_tools)
+            )
+            self._last_body = continuation_body
+            self._last_client_tools = continuation_tools
+            self._persist_request_context()
+            self._continuation.schedule(
+                connection,
+                continuation_body,
+                continuation_tools,
+            )
+        else:
+            self._continuation.rearm()
+
+    async def _drain_interactions(self) -> None:
+        while self._pending_interactions:
+            await self._interactions_idle.wait()
+
+    def _has_incomplete_tool_batch(self) -> bool:
+        assistant = next(
+            (
+                message
+                for message in reversed(self.messages)
+                if message["role"] == "assistant"
+            ),
+            None,
+        )
+        if assistant is None:
+            return False
+        states = {
+            part.get("state")
+            for part in assistant.get("parts", [])
+            if isinstance(part.get("toolCallId"), str)
+        }
+        return bool(
+            states & set(TOOL_RESOLVED_STATES + ("approval-responded",))
+        ) and bool(states & {"input-available", "approval-requested"})
+
+    def _spawn_continuation(
+        self,
+        factory: Callable[[], Any],
+    ) -> None:
+        self._lifecycle._retain_work(factory)
 
     # -- hooks -----------------------------------------------------------
 
@@ -805,16 +1001,33 @@ class AIChatAgent(Agent):
         abort: asyncio.Event,
         context: TurnContext,
     ) -> str | None:
-        return await self._run_turn(
-            None,
+        message_id = f"msg-{gen_id()}"
+        body = {"agentToolInput": input}
+        recovery = self._turn_recovery_payload(
             request_id,
-            "submit-message",
-            {"agentToolInput": input},
-            abort,
-            context,
-            transcript=list(self.messages),
-            broadcast_transcript=not self._messages_truncated,
+            message_id,
+            body,
+            None,
+            continuation=False,
         )
+        result: str | None = None
+
+        async def run() -> None:
+            nonlocal result
+            result = await self._run_turn(
+                None,
+                request_id,
+                "submit-message",
+                body,
+                abort,
+                context,
+                message_id=message_id,
+                transcript=list(self.messages),
+                broadcast_transcript=not self._messages_truncated,
+            )
+
+        await self._run_chat_turn_task(request_id, recovery, run)
+        return result
 
     async def collect_agent_tool_result(
         self,
@@ -942,6 +1155,36 @@ class AIChatAgent(Agent):
 
     # -- dispatch --------------------------------------------------------
 
+    async def _dispatch_connect(
+        self,
+        connection: Connection,
+        ctx: ConnectionContext,
+    ) -> None:
+        await super()._dispatch_connect(connection, ctx)
+        if not self.should_send_protocol_messages(connection, ctx):
+            return
+        if self._resumable.has_active_stream() or self._pre_stream.latest_request_id:
+            return
+        recovering = await self.ctx.storage.get(CHAT_RECOVERING_KEY)
+        if not isinstance(recovering, dict):
+            return
+        at = recovering.get("at")
+        request_id = recovering.get("requestId")
+        if (
+            type(at) is not int
+            or not isinstance(request_id, str)
+            or now_ms() - at >= CHAT_RECOVERING_FLAG_TTL_MS
+        ):
+            await self.ctx.storage.delete(CHAT_RECOVERING_KEY)
+            return
+        connection.send_if_open(
+            {
+                "type": ChatMessageType.CHAT_RECOVERING,
+                "recovering": True,
+                "id": request_id,
+            }
+        )
+
     async def _dispatch_message(self, connection: Connection, message: str) -> None:
         # not JSON, not an object, or a binary frame — hand it straight to the user
         data = loads_dict_or_none(message)
@@ -956,7 +1199,7 @@ class AIChatAgent(Agent):
         elif _type == ChatMessageType.CHAT_CLEAR:
             await self._handle_chat_clear(connection)
         elif _type == ChatMessageType.CHAT_REQUEST_CANCEL:
-            self._handle_cancel(data)
+            await self._handle_cancel(data)
         elif _type == ChatMessageType.CHAT_MESSAGES:
             messages = data.get("messages")
             if not isinstance(messages, list):
@@ -972,9 +1215,17 @@ class AIChatAgent(Agent):
         elif _type == ChatMessageType.TOOL_RESULT:
             # Awaited rather than left to run on its own, so answers commit in the order
             # they arrive and the read-modify-write inside stays uninterrupted.
-            await self._handle_tool_result(data)
+            token = _TOOL_INTERACTION_CONNECTION.set(connection)
+            try:
+                await self._handle_tool_result(data)
+            finally:
+                _TOOL_INTERACTION_CONNECTION.reset(token)
         elif _type == ChatMessageType.TOOL_APPROVAL:
-            await self._handle_tool_approval(data)
+            token = _TOOL_INTERACTION_CONNECTION.set(connection)
+            try:
+                await self._handle_tool_approval(data)
+            finally:
+                _TOOL_INTERACTION_CONNECTION.reset(token)
         else:
             await super()._dispatch_message(connection, message)
 
@@ -990,24 +1241,37 @@ class AIChatAgent(Agent):
         self._pending_resume_connections.discard(connection.id)
         self._pending_resume_requests.pop(connection.id, None)
         self._pre_stream.release(connection.id)
+        self._continuation.release_connection(connection.id)
         await super()._dispatch_close(connection, code, reason, was_clean)
 
     async def _handle_chat_clear(self, connection: Connection) -> None:
         await self._ensure_chat_storage_ready()
         self._turn_queue.reset()
+        active_request_ids = tuple(self._aborts)
         for abort in self._aborts.values():
             abort.set()
+        for request_id in active_request_ids:
+            self._broadcast_terminal(request_id)
         self._child_agent_tool_runs.abort_active()
+        self._continuation.reset()
+        self._continuation_request_ids.clear()
+
+        task_rows = self.sql(
+            "SELECT run_id FROM cf_agents_task_runs WHERE definition IN (?, ?) "
+            "AND state NOT IN ('completed', 'failed', 'cancelled')",
+            _CHAT_TURN_TASK,
+            _CHAT_RECOVERY_TASK,
+        )
+        for row in task_rows:
+            await self.tasks.cancel(row["run_id"], "chat cleared")
 
         await self._session.clear_messages()
-        self.sql(
-            "DELETE FROM cf_agents_runs WHERE name LIKE ?",
-            f"{_CHAT_FIBER_PREFIX}%",
+        incident_keys = await self.ctx.storage.list(
+            {"prefix": CHAT_RECOVERY_INCIDENT_KEY_PREFIX}
         )
-        self.sql(
-            "DELETE FROM cf_agents_fibers WHERE name LIKE ?",
-            f"{_CHAT_FIBER_PREFIX}%",
-        )
+        recovery_keys = [*incident_keys, CHAT_RECOVERING_KEY]
+        await self.ctx.storage.delete(recovery_keys)
+        self._clear_request_context()
         self._pre_stream.release_awaiting()
         self._resumable.clear_all()
         self._pre_stream.reset()
@@ -1016,7 +1280,7 @@ class AIChatAgent(Agent):
         self.broadcast_json(chat_clear_frame(), exclude=(connection.id,))
         self._spawn_reschedule()
 
-    def _handle_cancel(self, data: dict[str, Any]) -> None:
+    async def _handle_cancel(self, data: dict[str, Any]) -> None:
         request_id = data.get("id")
         if not isinstance(request_id, str):
             return
@@ -1024,6 +1288,11 @@ class AIChatAgent(Agent):
         abort = self._aborts.get(request_id)
         if abort is not None:
             abort.set()
+            self._broadcast_terminal(request_id)
+            self._resumable.cancel_request(request_id)
+        run_id = self._request_task_runs.get(request_id)
+        if run_id is not None:
+            await self.tasks.cancel(run_id, "chat request cancelled")
 
     def _handle_resume_request(
         self,
@@ -1035,7 +1304,43 @@ class AIChatAgent(Agent):
         # of a live turn, so the offer cannot interleave with a chunk broadcast.
         probe_id = data.get("probeId")
         if self._resumable.has_active_stream():
-            self._notify_stream_resuming(connection, probe_id)
+            if (
+                self._continuation.active_request_id
+                == self._resumable.active_request_id
+                and self._continuation.active_connection_id not in (None, connection.id)
+                and self._continuation.active_connection_id in self._connections
+            ):
+                self._send_resume_none(
+                    connection,
+                    probe_id,
+                    reason="continuation-owned",
+                )
+            else:
+                self._notify_stream_resuming(connection, probe_id)
+        elif (
+            self._continuation.pending is not None
+            and self._continuation.pending.connection_id == connection.id
+        ):
+            self._continuation.awaiting_connections[connection.id] = (
+                connection,
+                probe_id,
+            )
+            connection.send_if_open(
+                {
+                    "type": ChatMessageType.STREAM_PENDING,
+                    "id": self._continuation.pending.request_id,
+                    **({"probeId": probe_id} if probe_id is not None else {}),
+                }
+            )
+        elif (
+            self._continuation.pending is not None
+            and self._continuation.pending.connection_id in self._connections
+        ):
+            self._send_resume_none(
+                connection,
+                probe_id,
+                reason="continuation-owned",
+            )
         elif (terminal := self._resumable.latest_terminal_error()) is not None:
             self._notify_stream_resuming(
                 connection,
@@ -1069,7 +1374,13 @@ class AIChatAgent(Agent):
             terminal := self._resumable.latest_terminal_error()
         ) is not None and terminal.request_id == request_id:
             self._resumable.replay_error_chunks(connection, request_id)
-            connection.send_if_open(self._terminal_frame(request_id, terminal.body))
+            connection.send_if_open(
+                self._terminal_frame(
+                    request_id,
+                    terminal.body,
+                    continuation=terminal.is_continuation,
+                )
+            )
         elif not self._resumable.replay_completed_chunks(connection, request_id):
             # A different stream may now be active, but this ACK is for its own id: if
             # that turn already completed its buffer is still retained and gets replayed
@@ -1081,6 +1392,7 @@ class AIChatAgent(Agent):
                     request_id,
                     done=True,
                     replay=True,
+                    continuation=self._is_continuation_request(request_id),
                 )
             )
 
@@ -1105,8 +1417,10 @@ class AIChatAgent(Agent):
         self,
         connection: Connection,
         probe_id: Any = None,
+        *,
+        reason: str = "idle",
     ) -> None:
-        connection.send_if_open(stream_resume_none_frame(probe_id))
+        connection.send_if_open(stream_resume_none_frame(probe_id, reason=reason))
 
     # -- the turn --------------------------------------------------------
 
@@ -1131,9 +1445,15 @@ class AIChatAgent(Agent):
         # Everything past here has an id and must answer: the client resolves only on a
         # terminal frame, so a silent escape leaves its promise pending forever.
         if request_id in self._aborts:
-            self._send_terminal(connection, request_id, error="Request already active")
+            self._send_terminal(
+                connection,
+                request_id,
+                error="Request already active",
+                dedupe=False,
+            )
             return
 
+        self._terminal_request_ids.discard(request_id)
         self._pre_stream.begin(request_id)
         terminal = self._resumable.latest_terminal_error()
         if terminal is not None:
@@ -1173,10 +1493,15 @@ class AIChatAgent(Agent):
                 request_id,
                 error=error_message(exc),
             )
-            self._resumable.record_terminal_error(request_id, error_message(exc))
+            self._resumable.record_terminal_error(
+                request_id,
+                error_message(exc),
+                continuation=self._is_continuation_request(request_id),
+            )
             await self._report_error(exc, connection)
         finally:
             self._aborts.pop(request_id, None)
+            self._terminal_request_ids.discard(request_id)
             if self._pre_stream.settle(request_id):
                 terminal = self._resumable.latest_terminal_error()
                 if terminal is None:
@@ -1211,15 +1536,15 @@ class AIChatAgent(Agent):
                 raise TypeError(f"invalid chat message at index {index}")
             transformed.append(message)
 
-        if self.durable_chat_recovery and self._facet_name is not None:
-            raise RuntimeError(
-                "durable chat recovery is not supported for facet agents"
-            )
-
         trigger = payload.pop("trigger", None)
         if trigger not in ("regenerate-message", "submit-message"):
             trigger = "submit-message"
-        payload.pop("clientTools", None)  # tools are not supported yet
+        client_tools = payload.pop("clientTools", None)
+        if not isinstance(client_tools, list):
+            client_tools = None
+        self._last_client_tools = client_tools
+        self._last_body = dict(payload)
+        self._persist_request_context()
 
         transcript = await self._persist_messages(
             transformed,
@@ -1227,39 +1552,32 @@ class AIChatAgent(Agent):
             delete_stale_rows=True,
         )
 
-        if not self.durable_chat_recovery:
-            await self._run_turn(
-                connection,
-                request_id,
-                trigger,
-                payload,
-                abort,
-                context,
-                transcript=transcript,
-            )
-            return
-
         message_id = f"msg-{gen_id()}"
         latest_user_id = next(
             (
                 message.get("id")
-                for message in reversed(incoming)
+                for message in reversed(transformed)
                 if message.get("role") == "user"
             ),
             None,
         )
-        metadata = {
+        recovery = {
             "version": _CHAT_RECOVERY_VERSION,
             "requestId": request_id,
             "messageId": message_id,
             "trigger": trigger,
             "body": payload,
+            "clientTools": client_tools,
+            "continuation": False,
+            "recoveryRootRequestId": request_id,
             "latestUserMessageId": latest_user_id,
             "startedAt": now_ms(),
         }
 
-        async def run(_ctx) -> str | None:
-            return await self._run_turn(
+        await self._run_chat_turn_task(
+            request_id,
+            recovery,
+            lambda: self._run_turn(
                 connection,
                 request_id,
                 trigger,
@@ -1268,16 +1586,172 @@ class AIChatAgent(Agent):
                 context,
                 message_id=message_id,
                 transcript=transcript,
-            )
-
-        result = await self.start_fiber(
-            f"{_CHAT_FIBER_PREFIX}{request_id}",
-            run,
-            metadata=metadata,
-            wait_for_completion=True,
+                client_tools=client_tools,
+            ),
         )
-        if result.status in ("completed", "aborted", "error"):
-            self._delete_settled_fiber(result.fiber_id)
+
+    async def _run_chat_turn_task(
+        self,
+        request_id: str,
+        recovery: dict[str, Any],
+        run: Callable[[], Any],
+    ) -> None:
+        nonce = gen_id()
+        run_id = f"{_CHAT_TASK_RUN_PREFIX}{nonce}"
+        self._live_chat_turns[nonce] = run
+        self._request_task_runs[request_id] = run_id
+        try:
+            receipt = await self.tasks._run_reserved(
+                _CHAT_TURN_TASK,
+                {**recovery, "nonce": nonce},
+                run_id=run_id,
+                metadata={"requestId": request_id},
+                retain=False,
+            )
+            await self.tasks._execution_task(receipt.run_id)
+        finally:
+            self._live_chat_turns.pop(nonce, None)
+            if self._request_task_runs.get(request_id) == run_id:
+                self._request_task_runs.pop(request_id, None)
+
+    async def _chat_turn_task(self, input: Any, step: TaskStep) -> None:
+        if not isinstance(input, dict):
+            raise TypeError("chat turn Task input must be an object")
+        nonce = input.get("nonce")
+        if not isinstance(nonce, str):
+            raise TypeError("chat turn Task input requires a nonce")
+
+        async def model_turn(_attempt) -> None:
+            live = self._live_chat_turns.get(nonce)
+            if live is not None:
+                result = live()
+                if inspect.isawaitable(result):
+                    await result
+                return
+            if self.durable_chat_recovery:
+                await self._recover_interrupted_chat_turn(input)
+
+        await step.do(
+            "model-turn",
+            TaskStepConfig(
+                retries=TaskStepRetryOptions(limit=1),
+                timeout="1 day",
+            ),
+            model_turn,
+        )
+
+    async def _chat_recovery_task(self, input: Any, step: TaskStep) -> None:
+        if not isinstance(input, dict) or not isinstance(input.get("data"), dict):
+            raise TypeError("chat recovery Task input must be an object")
+        delay = input.get("delaySeconds", 0)
+        if not isinstance(delay, (int, float)) or isinstance(delay, bool) or delay < 0:
+            raise TypeError("chat recovery Task delay must be non-negative")
+        if delay:
+            await step.sleep("backoff", delay * 1000)
+
+        async def continuation(_attempt) -> None:
+            await self._dispatch_recovery_handoff(input["data"])
+
+        await step.do(
+            "continuation",
+            TaskStepConfig(
+                retries=TaskStepRetryOptions(limit=1),
+                timeout="15 minutes",
+            ),
+            continuation,
+        )
+
+    async def _fire_auto_continuation(
+        self,
+        pending: ContinuationRequest,
+    ) -> None:
+        request_id = pending.request_id
+        self._continuation_request_ids.add(request_id)
+        abort = asyncio.Event()
+        self._aborts[request_id] = abort
+        self._pre_stream.begin(request_id)
+        try:
+            assistant = next(
+                (
+                    message
+                    for message in reversed(self.messages)
+                    if message["role"] == "assistant"
+                ),
+                None,
+            )
+            if assistant is None:
+                self._continuation.reset()
+                return
+
+            async def run(context: TurnContext) -> None:
+                recovery = self._turn_recovery_payload(
+                    request_id,
+                    assistant["id"],
+                    pending.body,
+                    pending.client_tools,
+                    continuation=True,
+                )
+                await self._run_chat_turn_task(
+                    request_id,
+                    recovery,
+                    lambda: self._run_turn(
+                        pending.connection,
+                        request_id,
+                        "submit-message",
+                        pending.body,
+                        abort,
+                        context,
+                        message_id=assistant["id"],
+                        transcript=list(self.messages),
+                        continuation=True,
+                        client_tools=pending.client_tools,
+                    ),
+                )
+
+            result = await self._turn_queue.enqueue(request_id, run)
+            if result.status == "stale":
+                self._continuation.reset()
+        except Exception as exc:
+            if _is_platform_failure(exc):
+                raise
+            self._continuation.reset()
+            await self._report_error(exc, pending.connection)
+        finally:
+            self._aborts.pop(request_id, None)
+            self._terminal_request_ids.discard(request_id)
+            if self._pre_stream.settle(request_id):
+                self._pre_stream.release_awaiting()
+
+    def _turn_recovery_payload(
+        self,
+        request_id: str,
+        message_id: str,
+        body: dict[str, Any],
+        client_tools: list[Any] | None,
+        *,
+        continuation: bool,
+        recovery_root_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        latest_user_id = next(
+            (
+                message["id"]
+                for message in reversed(self.messages)
+                if message["role"] == "user"
+            ),
+            None,
+        )
+        return {
+            "version": _CHAT_RECOVERY_VERSION,
+            "requestId": request_id,
+            "messageId": message_id,
+            "trigger": "submit-message",
+            "body": body,
+            "clientTools": client_tools,
+            "continuation": continuation,
+            "recoveryRootRequestId": recovery_root_request_id or request_id,
+            "latestUserMessageId": latest_user_id,
+            "startedAt": now_ms(),
+        }
 
     async def _run_turn(
         self,
@@ -1291,10 +1765,34 @@ class AIChatAgent(Agent):
         message_id: str | None = None,
         transcript: list[MessageT] | None = None,
         broadcast_transcript: bool = True,
+        continuation: bool = False,
+        client_tools: list[Any] | None = None,
     ) -> str | None:
         message_id = message_id or f"msg-{gen_id()}"
-        options = ChatOptions(request_id, trigger, body, abort)
-        parts: list[ChunkT] = []
+        options = ChatOptions(
+            request_id,
+            trigger,
+            body,
+            abort,
+            continuation=continuation,
+            client_tools=client_tools,
+        )
+        prior_message = (
+            next(
+                (
+                    message
+                    for message in reversed(transcript or self.messages)
+                    if message.get("role") == "assistant"
+                    and message.get("id") == message_id
+                ),
+                None,
+            )
+            if continuation
+            else None
+        )
+        parts: list[ChunkT] = copy.deepcopy(
+            prior_message.get("parts", []) if prior_message is not None else []
+        )
         # part type -> chunk id, for blocks opened but not yet closed
         open_blocks: dict[str, str] = {}
 
@@ -1302,12 +1800,25 @@ class AIChatAgent(Agent):
         # the first chunk so a resume probe never observes accepted work as idle.
         self._resumable.clear_terminal_error()
         try:
-            stream_id = self._resumable.start(request_id, message_id)
+            stream_id = self._resumable.start(
+                request_id,
+                message_id,
+                continuation=continuation,
+            )
         except Exception as exc:  # noqa: BLE001
             error = error_message(exc)
-            self._resumable.record_terminal_error(request_id, error)
+            self._resumable.record_terminal_error(
+                request_id,
+                error,
+                continuation=continuation,
+            )
             if connection is not None:
-                self._send_terminal(connection, request_id, error=error)
+                self._send_terminal(
+                    connection,
+                    request_id,
+                    error=error,
+                    continuation=continuation,
+                )
             await self._report_error(exc, connection)
             return error
         for connection_id, pending_request_id in tuple(
@@ -1323,11 +1834,31 @@ class AIChatAgent(Agent):
                 request_id=request_id,
             )
         )
+        if self._continuation.pending is not None:
+            self._continuation.activate(request_id)
+            for pending, _probe_id in tuple(
+                self._continuation.awaiting_connections.values()
+            ):
+                self._notify_stream_resuming(pending, request_id=request_id)
+            self._continuation.awaiting_connections.clear()
         self._spawn_reschedule()
 
         # Shares the parts list rather than copying it, so settling a part in place is
         # visible through both.
-        message: MessageT = {"id": message_id, "role": "assistant", "parts": parts}
+        message: MessageT = {
+            **(
+                {
+                    key: copy.deepcopy(value)
+                    for key, value in prior_message.items()
+                    if key not in ("id", "role", "parts")
+                }
+                if prior_message is not None
+                else {}
+            ),
+            "id": message_id,
+            "role": "assistant",
+            "parts": parts,
+        }
         accumulator = MessageAccumulator(parts, message)
 
         # The final write detaches this under the interaction lock, so an arriving tool
@@ -1346,7 +1877,16 @@ class AIChatAgent(Agent):
 
                 reply = self.on_chat_message(options)
                 if inspect.isawaitable(reply):
-                    reply = await reply
+                    try:
+                        if self.chat_provider_stall_timeout_ms is None:
+                            reply = await reply
+                        else:
+                            reply = await asyncio.wait_for(
+                                reply,
+                                self.chat_provider_stall_timeout_ms / 1000,
+                            )
+                    except TimeoutError as exc:
+                        raise TimeoutError("Chat provider stream stalled") from exc
 
                 if not self._turn_queue.is_current(context):
                     self._resumable.mark_error(stream_id)
@@ -1354,7 +1894,20 @@ class AIChatAgent(Agent):
                         self._send_terminal(connection, request_id)
                     return None
 
-                async for chunk in _normalize(reply):
+                chunks = _normalize(reply).__aiter__()
+                while True:
+                    try:
+                        if self.chat_provider_stall_timeout_ms is None:
+                            chunk = await anext(chunks)
+                        else:
+                            chunk = await asyncio.wait_for(
+                                anext(chunks),
+                                self.chat_provider_stall_timeout_ms / 1000,
+                            )
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError as exc:
+                        raise TimeoutError("Chat provider stream stalled") from exc
                     if not self._turn_queue.is_current(context):
                         self._resumable.mark_error(stream_id)
                         if connection is not None:
@@ -1370,13 +1923,20 @@ class AIChatAgent(Agent):
                     if effect.terminal_error is not None:
                         self._resumable.mark_error(stream_id)
                         self._resumable.record_terminal_error(
-                            request_id, effect.terminal_error
+                            request_id,
+                            effect.terminal_error,
+                            continuation=continuation,
                         )
-                        self._broadcast_terminal(request_id, effect.terminal_error)
+                        self._broadcast_terminal(
+                            request_id,
+                            effect.terminal_error,
+                            continuation=continuation,
+                        )
                         return effect.terminal_error
 
                     self._track_open_block(open_blocks, chunk)
                     self._emit(stream_id, request_id, chunk)
+                    await self._maybe_bump_recovery_progress(chunk)
 
                     if effect.persist_now:
                         await self._persist_streaming_snapshot(message)
@@ -1414,98 +1974,700 @@ class AIChatAgent(Agent):
                 # Terminal first so the promise settles, then notify. Marking errored
                 # keeps the stream from being offered for resume.
                 self._resumable.mark_error(stream_id)
-                self._resumable.record_terminal_error(request_id, error_message(exc))
+                self._resumable.record_terminal_error(
+                    request_id,
+                    error_message(exc),
+                    continuation=continuation,
+                )
                 self._broadcast_terminal(
                     request_id,
                     error=error_message(exc),
+                    continuation=continuation,
                 )
                 await self._report_error(exc, connection)
                 return error_message(exc)
 
             self._resumable.complete(stream_id)
-            self._broadcast_terminal(request_id)
+            self._broadcast_terminal(request_id, continuation=continuation)
             return None
         finally:
             self._streaming_message = None
+            if continuation:
+                self._continuation.finish(request_id)
+            else:
+                self._continuation.rearm()
             self._spawn_reschedule()
 
-    async def _handle_internal_fiber_recovery(self, ctx: FiberRecoveryContext) -> bool:
-        if not ctx.name.startswith(_CHAT_FIBER_PREFIX):
-            return await super()._handle_internal_fiber_recovery(ctx)
+    async def on_chat_recovery(self, _context: dict[str, Any]) -> dict[str, Any]:
+        """Customize whether an interrupted partial is persisted and continued."""
+        return {}
 
-        metadata = ctx.metadata
-        if not isinstance(metadata, dict):
-            return False
-        if metadata.get("version") != _CHAT_RECOVERY_VERSION:
-            return False
-        request_id = metadata.get("requestId")
-        message_id = metadata.get("messageId")
+    async def on_chat_recovery_exhausted(self, _context: dict[str, Any]) -> None:
+        """Observe a recovery incident after its bounded budget is exhausted."""
+
+    async def _recover_interrupted_chat_turn(self, recovery: dict[str, Any]) -> None:
+        request_id = recovery.get("requestId")
+        message_id = recovery.get("messageId")
         if not isinstance(request_id, str) or not isinstance(message_id, str):
-            return False
-
+            raise TypeError("interrupted chat turn has invalid recovery identity")
+        stream = self._resumable.latest_for_request(request_id)
+        current_message_id = stream.message_id if stream is not None else message_id
+        latest_user_id = recovery.get("latestUserMessageId")
+        leaf = self.messages[-1] if self.messages else None
+        if (
+            not isinstance(latest_user_id, str)
+            or leaf is None
+            or leaf.get("id") not in (latest_user_id, current_message_id)
+        ):
+            stale = stream
+            if stale is not None and stale.status == StreamStatus.STREAMING:
+                self._resumable.mark_orphaned(stale.stream_id)
+            return
         snapshot = self._resumable.recovery_snapshot(
             request_id,
+            current_message_id,
             max_chunks=self.chat_recovery_max_chunks,
             max_bytes=self.chat_recovery_max_bytes,
         )
-        if snapshot is None:
-            return True
-        if snapshot.stream.status != StreamStatus.STREAMING:
-            return True
-        message_id = snapshot.stream.message_id or message_id
-
-        if snapshot.limit_exceeded:
-            error = "Recovered chat stream exceeded transcript reconstruction limits"
-            self._resumable.mark_error(snapshot.stream.stream_id)
-            self._resumable.record_terminal_error(request_id, error)
-            self._spawn_reschedule()
-            return True
-
-        bodies = snapshot.bodies
-
-        parts: list[ChunkT] = []
-        message: MessageT = {"id": message_id, "role": "assistant", "parts": parts}
+        if snapshot is not None and snapshot.stream.status != StreamStatus.STREAMING:
+            return
+        continuation = bool(recovery.get("continuation"))
+        stream_id = snapshot.stream.stream_id if snapshot is not None else ""
+        message_id = (
+            snapshot.stream.message_id or message_id
+            if snapshot is not None
+            else message_id
+        )
+        existing = next(
+            (message for message in self.messages if message.get("id") == message_id),
+            None,
+        )
+        parts: list[ChunkT] = copy.deepcopy(
+            existing.get("parts", []) if continuation and existing is not None else []
+        )
+        message: MessageT = {
+            **(
+                {
+                    key: copy.deepcopy(value)
+                    for key, value in existing.items()
+                    if key not in ("id", "role", "parts")
+                }
+                if existing is not None
+                else {}
+            ),
+            "id": message_id,
+            "role": "assistant",
+            "parts": parts,
+        }
         accumulator = MessageAccumulator(parts, message)
-        for body in bodies:
+        partial_parts_start = len(parts)
+        for body in snapshot.bodies if snapshot is not None else ():
             chunk = loads_dict_or_none(body)
             if chunk is None or accumulator.should_suppress(chunk):
                 continue
             effect = accumulator.apply(chunk)
             if effect.terminal_error is not None:
-                self._resumable.mark_error(snapshot.stream.stream_id)
-                self._resumable.record_terminal_error(request_id, effect.terminal_error)
-                self._spawn_reschedule()
-                return True
-
+                if stream_id:
+                    self._resumable.mark_error(stream_id)
+                self._resumable.record_terminal_error(
+                    request_id,
+                    effect.terminal_error,
+                    continuation=continuation,
+                )
+                return
         for part in parts:
             if part.get("state") == "streaming":
                 part["state"] = "done"
 
-        if parts:
-            await self._persist_finished_streaming_message(
-                message,
-                broadcast=not self._messages_truncated,
+        if snapshot is not None and snapshot.limit_exceeded:
+            if len(parts) > partial_parts_start:
+                await self._persist_recovered_partial(message)
+            await self._exhaust_recovery(
+                recovery,
+                "reconstruction_limits_exceeded",
+                stream_id=snapshot.stream.stream_id,
             )
-            if self._messages_truncated:
-                self.broadcast_json(message_updated_frame(message))
-        self._resumable.complete(snapshot.stream.stream_id)
-        self._broadcast_terminal(request_id)
-        self._spawn_reschedule()
-        return True
+            return
 
-    def _defer_internal_fiber_recovery(self, ctx: FiberRecoveryContext) -> bool:
-        if not self._is_chat_fiber(ctx):
-            return super()._defer_internal_fiber_recovery(ctx)
-        return not self._chat_startup_complete or bool(
-            self.sql(
-                "SELECT name FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'cf_ai_chat_agent_messages'"
+        recovery_kind = (
+            "continue" if continuation or len(parts) > partial_parts_start else "retry"
+        )
+        incident, exhausted = await self._begin_recovery_incident(
+            recovery,
+            recovery_kind,
+        )
+        if exhausted:
+            if len(parts) > partial_parts_start:
+                await self._persist_recovered_partial(message)
+            await self._exhaust_recovery(
+                recovery,
+                str(incident.get("reason") or "max_attempts_exceeded"),
+                incident=incident,
+                stream_id=stream_id,
             )
+            return
+
+        context = {
+            "incidentId": incident["incidentId"],
+            "recoveryRootRequestId": recovery.get("recoveryRootRequestId")
+            or request_id,
+            "attempt": incident["attempt"],
+            "maxAttempts": incident["maxAttempts"],
+            "recoveryKind": recovery_kind,
+            "streamId": stream_id,
+            "requestId": request_id,
+            "partialParts": copy.deepcopy(parts[partial_parts_start:]),
+            "messages": copy.deepcopy(self.messages),
+            "createdAt": recovery.get("startedAt"),
+        }
+        try:
+            options = self.on_chat_recovery(context)
+            if inspect.isawaitable(options):
+                options = await options
+            if not isinstance(options, dict):
+                options = {}
+            settled = any(
+                part.get("state") in TOOL_RESOLVED_STATES
+                for part in parts[partial_parts_start:]
+            )
+            if len(parts) > partial_parts_start and (
+                options.get("persist") is not False or settled
+            ):
+                await self._persist_recovered_partial(message)
+            if stream_id:
+                self._resumable.complete(stream_id)
+            self._broadcast_terminal(request_id, continuation=continuation)
+            if self._awaiting_client_interaction():
+                await self._update_recovery_incident(
+                    incident,
+                    "skipped",
+                    "awaiting_client_interaction",
+                )
+                return
+            if options.get("continue") is False:
+                await self._update_recovery_incident(
+                    incident,
+                    "skipped",
+                    "continue_disabled",
+                )
+                return
+            target = (
+                message_id
+                if recovery_kind == "continue"
+                and any(message.get("id") == message_id for message in self.messages)
+                else None
+            )
+            data = {
+                "incidentId": incident["incidentId"],
+                "kind": "continue" if target is not None else "retry",
+                "originalRequestId": recovery.get("recoveryRootRequestId")
+                or request_id,
+                "latestUserMessageId": recovery.get("latestUserMessageId"),
+                "body": recovery.get("body")
+                if isinstance(recovery.get("body"), dict)
+                else copy.deepcopy(self._last_body),
+                "clientTools": recovery.get("clientTools")
+                if isinstance(recovery.get("clientTools"), list)
+                else copy.deepcopy(self._last_client_tools),
+                **({"targetAssistantId": target} if target is not None else {}),
+            }
+            await self._update_recovery_incident(incident, "scheduled")
+            await self._set_recovering(True, data["originalRequestId"])
+            try:
+                await self._enqueue_recovery(data, initial=True)
+            except BaseException as exc:
+                if not _is_platform_failure(exc):
+                    raise
+                await self._exhaust_recovery(
+                    recovery,
+                    "acceptance_failed",
+                    incident=incident,
+                    stream_id=stream_id,
+                )
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError) or _is_platform_failure(exc):
+                raise
+            await self._update_recovery_incident(
+                incident,
+                "failed",
+                error_message(exc),
+            )
+            raise
+
+    async def _persist_recovered_partial(self, message: MessageT) -> None:
+        await self._persist_finished_streaming_message(
+            message,
+            broadcast=not self._messages_truncated,
+        )
+        if self._messages_truncated:
+            self.broadcast_json(message_updated_frame(message))
+
+    async def _begin_recovery_incident(
+        self,
+        recovery: dict[str, Any],
+        recovery_kind: str,
+    ) -> tuple[dict[str, Any], bool]:
+        now = now_ms()
+        stored = await self.ctx.storage.list(
+            {"prefix": CHAT_RECOVERY_INCIDENT_KEY_PREFIX}
+        )
+        stale = [
+            key
+            for key, value in stored.items()
+            if not isinstance(value, dict)
+            or now - int(value.get("lastAttemptAt") or value.get("firstSeenAt") or 0)
+            > CHAT_RECOVERY_INCIDENT_TTL_MS
+        ]
+        if stale:
+            await self.ctx.storage.delete(stale)
+        request_id = str(recovery["requestId"])
+        root_id = recovery.get("recoveryRootRequestId")
+        user_id = recovery.get("latestUserMessageId")
+        value = incident_id(
+            request_id,
+            root_id if isinstance(root_id, str) else None,
+            user_id if isinstance(user_id, str) else None,
+        )
+        key = incident_key(value)
+        existing = await self.ctx.storage.get(key)
+        if isinstance(existing, dict) and existing.get("status") == "exhausted":
+            return existing, True
+        progress = await self.ctx.storage.get(CHAT_RECOVERY_PROGRESS_KEY)
+        decision = evaluate_incident(
+            request_id=request_id,
+            recovery_root_request_id=root_id if isinstance(root_id, str) else None,
+            latest_user_message_id=user_id if isinstance(user_id, str) else None,
+            recovery_kind="continue" if recovery_kind == "continue" else "retry",
+            existing=existing if isinstance(existing, dict) else None,
+            progress=progress if type(progress) is int else 0,
+            awaiting_client_interaction=self._awaiting_client_interaction(),
+            now=now,
+            policy=RecoveryPolicy(
+                max_attempts=self.chat_recovery_max_attempts,
+                no_progress_timeout_ms=self.chat_recovery_no_progress_timeout_ms,
+                max_work=self.chat_recovery_max_work,
+                max_oom_retries=self.chat_recovery_max_oom_retries,
+            ),
+        )
+        await self.ctx.storage.put(key, decision.incident)
+        return decision.incident, decision.exhausted
+
+    async def _update_recovery_incident(
+        self,
+        incident: dict[str, Any],
+        status: str,
+        reason: str | None = None,
+    ) -> None:
+        key = incident_key(str(incident["incidentId"]))
+        if status == "completed":
+            await self.ctx.storage.delete(key)
+        else:
+            updated = {**incident, "status": status, "lastAttemptAt": now_ms()}
+            if reason is not None:
+                updated["reason"] = reason
+            await self.ctx.storage.put(key, updated)
+        if status in ("completed", "skipped", "failed", "exhausted"):
+            await self._set_recovering(False, None)
+
+    async def _set_recovering(self, active: bool, request_id: str | None) -> None:
+        existing = await self.ctx.storage.get(CHAT_RECOVERING_KEY)
+        if active:
+            if isinstance(existing, dict):
+                return
+            await self.ctx.storage.put(
+                CHAT_RECOVERING_KEY,
+                {"requestId": request_id, "at": now_ms()},
+            )
+        else:
+            if existing is None:
+                return
+            await self.ctx.storage.delete(CHAT_RECOVERING_KEY)
+            if request_id is None and isinstance(existing, dict):
+                value = existing.get("requestId")
+                request_id = value if isinstance(value, str) else None
+        frame: dict[str, Any] = {
+            "type": ChatMessageType.CHAT_RECOVERING,
+            "recovering": active,
+        }
+        if request_id is not None:
+            frame["id"] = request_id
+        self.broadcast_json(frame)
+
+    def _awaiting_client_interaction(self) -> bool:
+        return any(
+            part.get("state") in ("input-available", "approval-requested")
+            for message in reversed(self.messages)
+            if message.get("role") == "assistant"
+            for part in message.get("parts", [])
         )
 
-    @staticmethod
-    def _is_chat_fiber(ctx: FiberRecoveryContext) -> bool:
-        return ctx.name.startswith(_CHAT_FIBER_PREFIX)
+    async def _enqueue_recovery(
+        self,
+        data: dict[str, Any],
+        *,
+        initial: bool,
+        delay_seconds: float = 0,
+        run_id: str | None = None,
+    ) -> None:
+        callback = str(data.get("kind") or "retry")
+        acceptance_attempts = max(1, self.chat_recovery_acceptance_attempts)
+        for attempt in range(acceptance_attempts):
+            try:
+                await self.tasks._run_reserved(
+                    _CHAT_RECOVERY_TASK,
+                    {"data": data, "delaySeconds": delay_seconds},
+                    run_id=run_id,
+                    idempotency_key=(
+                        f"chat-recovery:{data['incidentId']}" if initial else None
+                    ),
+                    metadata={
+                        "callback": callback,
+                        "incidentId": str(data["incidentId"]),
+                        "recoveredRequestId": str(data["originalRequestId"]),
+                    },
+                    retain=False,
+                )
+                return
+            except BaseException as exc:
+                if not _is_platform_failure(exc) or attempt + 1 >= acceptance_attempts:
+                    raise
+
+    async def _redefer_recovery(self, data: dict[str, Any], reason: str) -> None:
+        sequence = int(data.get("redeferSequence") or 0) + 1
+        incident_value = data.get("incidentId")
+        if not isinstance(incident_value, str):
+            return
+        key = incident_key(incident_value)
+        stored_incident = await self.ctx.storage.get(key)
+        incident = (
+            stored_incident
+            if isinstance(stored_incident, dict)
+            else {
+                "incidentId": incident_value,
+                "maxAttempts": self.chat_recovery_max_attempts,
+            }
+        )
+        if sequence > int(
+            incident.get("maxAttempts") or self.chat_recovery_max_attempts
+        ):
+            await self._exhaust_recovery(
+                {"recoveryRootRequestId": data.get("originalRequestId")},
+                "max_attempts_exceeded",
+                incident=incident,
+            )
+            return
+        successor = {**data, "redeferSequence": sequence}
+        try:
+            await self._enqueue_recovery(
+                successor,
+                initial=False,
+                delay_seconds=self.chat_recovery_retry_delay_seconds,
+                run_id=(f"chat-recovery-redefer:{incident_value}:{reason}:{sequence}"),
+            )
+        except BaseException as exc:
+            if not _is_platform_failure(exc):
+                raise
+            await self._exhaust_recovery(
+                {"recoveryRootRequestId": data.get("originalRequestId")},
+                "acceptance_failed",
+                incident=incident,
+            )
+
+    async def _dispatch_recovery_handoff(self, data: dict[str, Any]) -> None:
+        started = asyncio.Event()
+
+        async def detached() -> None:
+            try:
+                await self._execute_recovery_attempt(data, started)
+            except BaseException as exc:
+                if _is_memory_limit_reset(exc):
+                    await self._handle_recovery_oom(data)
+                    return
+                if _is_platform_failure(exc):
+                    await self._redefer_recovery(data, "platform")
+                    return
+                raise
+
+        turn = asyncio.create_task(detached())
+        started_wait = asyncio.create_task(started.wait())
+        done, _ = await asyncio.wait(
+            {turn, started_wait},
+            return_when=asyncio.FIRST_COMPLETED,
+            timeout=self.chat_recovery_stable_timeout_ms / 1000,
+        )
+        if not done:
+            turn.cancel()
+            started_wait.cancel()
+            await asyncio.gather(turn, started_wait, return_exceptions=True)
+            await self._reschedule_stable_timeout(data)
+            return
+        if turn in done:
+            started_wait.cancel()
+            await asyncio.gather(started_wait, return_exceptions=True)
+            await turn
+            return
+        started_wait.cancel()
+        await asyncio.gather(started_wait, return_exceptions=True)
+        if not self._lifecycle.track_alarm_work(turn):
+            await turn
+
+    async def _reschedule_stable_timeout(self, data: dict[str, Any]) -> None:
+        incident_value = data.get("incidentId")
+        if not isinstance(incident_value, str):
+            return
+        key = incident_key(incident_value)
+        incident = await self.ctx.storage.get(key)
+        if not isinstance(incident, dict):
+            return
+        attempt = int(incident.get("attempt") or 0)
+        current_time = now_ms()
+        progress = await self.ctx.storage.get(CHAT_RECOVERY_PROGRESS_KEY)
+        progress_value = progress if type(progress) is int else 0
+        work = progress_value - int(incident.get("workBaseline") or 0)
+        reason = None
+        if attempt >= int(
+            incident.get("maxAttempts") or self.chat_recovery_max_attempts
+        ):
+            reason = "max_attempts_exceeded"
+        elif (
+            current_time - int(incident.get("lastProgressAt") or current_time)
+            > self.chat_recovery_no_progress_timeout_ms
+        ):
+            reason = "no_progress_timeout"
+        elif work > self.chat_recovery_max_work:
+            reason = "work_budget_exceeded"
+        if reason is not None:
+            await self._exhaust_recovery(
+                {"recoveryRootRequestId": data.get("originalRequestId")},
+                reason,
+                incident=incident,
+            )
+            return
+        updated = {
+            **incident,
+            "attempt": attempt + 1,
+            "status": "scheduled",
+            "reason": "stable_timeout_retry",
+            "lastAttemptAt": current_time,
+        }
+        await self.ctx.storage.put(key, updated)
+        await self._redefer_recovery(data, "stable-timeout")
+
+    async def _handle_recovery_oom(self, data: dict[str, Any]) -> None:
+        incident_value = data.get("incidentId")
+        if not isinstance(incident_value, str):
+            return
+        key = incident_key(incident_value)
+        incident = await self.ctx.storage.get(key)
+        if not isinstance(incident, dict):
+            return
+        oom_attempts = int(incident.get("oomAttempts") or 0) + 1
+        updated = {
+            **incident,
+            "oomAttempts": oom_attempts,
+            "lastAttemptAt": now_ms(),
+            "reason": "out_of_memory"
+            if oom_attempts > self.chat_recovery_max_oom_retries
+            else "oom_retry",
+        }
+        await self.ctx.storage.put(key, updated)
+        if oom_attempts > self.chat_recovery_max_oom_retries:
+            await self._exhaust_recovery(
+                {"recoveryRootRequestId": data.get("originalRequestId")},
+                "out_of_memory",
+                incident=updated,
+            )
+            return
+        await self._redefer_recovery(data, "out-of-memory")
+
+    async def _execute_recovery_attempt(
+        self,
+        data: dict[str, Any],
+        started: asyncio.Event,
+    ) -> None:
+        incident_value = data.get("incidentId")
+        if not isinstance(incident_value, str):
+            return
+        key = incident_key(incident_value)
+        incident = await self.ctx.storage.get(key)
+        if not isinstance(incident, dict) or incident.get("status") in (
+            "completed",
+            "exhausted",
+        ):
+            return
+        if self._awaiting_client_interaction():
+            await self._update_recovery_incident(
+                incident,
+                "skipped",
+                "awaiting_client_interaction",
+            )
+            return
+
+        kind = data.get("kind")
+        target_id = data.get("targetAssistantId")
+        latest_user_id = data.get("latestUserMessageId")
+        leaf = self.messages[-1] if self.messages else None
+        if kind == "continue":
+            if (
+                not isinstance(target_id, str)
+                or leaf is None
+                or leaf.get("role") != "assistant"
+                or leaf.get("id") != target_id
+            ):
+                await self._update_recovery_incident(
+                    incident,
+                    "skipped",
+                    "conversation_changed",
+                )
+                return
+            message_id = target_id
+        else:
+            if (
+                leaf is None
+                or leaf.get("role") != "user"
+                or isinstance(latest_user_id, str)
+                and leaf.get("id") != latest_user_id
+            ):
+                await self._update_recovery_incident(
+                    incident,
+                    "skipped",
+                    "conversation_changed",
+                )
+                return
+            message_id = f"msg-{gen_id()}"
+
+        request_id = gen_id()
+        if kind == "continue":
+            self._continuation_request_ids.add(request_id)
+        abort = asyncio.Event()
+        self._aborts[request_id] = abort
+        body_value = data.get("body")
+        body = (
+            cast(dict[str, Any], copy.deepcopy(body_value))
+            if isinstance(body_value, dict)
+            else dict(self._last_body)
+        )
+        client_tools = data.get("clientTools")
+        if not isinstance(client_tools, list):
+            client_tools = copy.deepcopy(self._last_client_tools)
+        else:
+            client_tools = copy.deepcopy(client_tools)
+        self._last_body = body
+        self._last_client_tools = client_tools
+        self._persist_request_context()
+        recovery = self._turn_recovery_payload(
+            request_id,
+            message_id,
+            body,
+            client_tools,
+            continuation=kind == "continue",
+            recovery_root_request_id=str(data.get("originalRequestId") or request_id),
+        )
+        turn_error: str | None = None
+        try:
+
+            async def run(context: TurnContext) -> None:
+                nonlocal turn_error
+
+                async def provider_turn() -> None:
+                    nonlocal turn_error
+                    started.set()
+                    turn_error = await self._run_turn(
+                        None,
+                        request_id,
+                        "submit-message",
+                        body,
+                        abort,
+                        context,
+                        message_id=message_id,
+                        transcript=list(self.messages),
+                        broadcast_transcript=not self._messages_truncated,
+                        continuation=kind == "continue",
+                        client_tools=client_tools,
+                    )
+
+                await self._run_chat_turn_task(request_id, recovery, provider_turn)
+
+            result = await self._turn_queue.enqueue(request_id, run)
+            if result.status == "stale":
+                await self._update_recovery_incident(
+                    incident,
+                    "skipped",
+                    "conversation_changed",
+                )
+            elif turn_error is None:
+                await self._update_recovery_incident(incident, "completed")
+            else:
+                await self._update_recovery_incident(incident, "failed", turn_error)
+        finally:
+            self._aborts.pop(request_id, None)
+            self._terminal_request_ids.discard(request_id)
+
+    async def _exhaust_recovery(
+        self,
+        recovery: dict[str, Any],
+        reason: str,
+        *,
+        incident: dict[str, Any] | None = None,
+        stream_id: str = "",
+    ) -> None:
+        if incident is not None and incident.get("exhaustionReported") is True:
+            return
+        request_id = str(
+            recovery.get("recoveryRootRequestId") or recovery.get("requestId") or ""
+        )
+        if stream_id:
+            self._resumable.mark_error(stream_id)
+        error = (
+            "Recovered chat stream exceeded transcript reconstruction limits"
+            if reason == "reconstruction_limits_exceeded"
+            else self.chat_recovery_terminal_message
+        )
+        continuation = self._is_continuation_request(request_id)
+        self._resumable.record_terminal_error(
+            request_id,
+            error,
+            continuation=continuation,
+        )
+        self._broadcast_terminal(
+            request_id,
+            error,
+            continuation=continuation,
+        )
+        context = {
+            "incidentId": (incident or {}).get("incidentId"),
+            "requestId": request_id,
+            "reason": reason,
+            "partialMessages": copy.deepcopy(self.messages),
+        }
+        if incident is not None:
+            incident = {**incident, "exhaustionReported": True}
+            await self._update_recovery_incident(incident, "exhausted", reason)
+        result = self.on_chat_recovery_exhausted(context)
+        if inspect.isawaitable(result):
+            await result
+        self._spawn_reschedule()
+
+    async def _maybe_bump_recovery_progress(self, chunk: ChunkT) -> None:
+        chunk_type = chunk.get("type")
+        milestone = chunk_type in (
+            "text-end",
+            "reasoning-end",
+            "tool-input-available",
+            "tool-output-available",
+            "tool-output-error",
+            "tool-output-denied",
+        )
+        delta = chunk_type in ("text-delta", "reasoning-delta", "tool-input-delta")
+        now = now_ms()
+        if not milestone and (not delta or now - self._last_progress_bump_at < 5_000):
+            return
+        current = await self.ctx.storage.get(CHAT_RECOVERY_PROGRESS_KEY)
+        await self.ctx.storage.put(
+            CHAT_RECOVERY_PROGRESS_KEY,
+            (current if type(current) is int else 0) + 1,
+        )
+        self._last_progress_bump_at = now
 
     def _collect_alarm_deadline(self, now: int, current: int | None) -> int | None:
         deadline = super()._collect_alarm_deadline(now, current)
@@ -1562,18 +2724,39 @@ class AIChatAgent(Agent):
         self._child_agent_tool_runs.capture_chunk(request_id, body)
         self.broadcast_json(
             chat_response(
-                ChatMessageType.USE_CHAT_RESPONSE, request_id, body, done=False
+                ChatMessageType.USE_CHAT_RESPONSE,
+                request_id,
+                body,
+                done=False,
+                continuation=self._resumable.active_is_continuation,
             ),
             exclude=self._pending_resume_connections,
         )
 
-    def _terminal_frame(self, request_id: str, error: str | None) -> dict[str, Any]:
+    def _is_continuation_request(self, request_id: str) -> bool:
+        if request_id in self._continuation_request_ids:
+            return True
+        stream = self._resumable.latest_for_request(request_id)
+        return stream is not None and stream.is_continuation
+
+    def _terminal_frame(
+        self,
+        request_id: str,
+        error: str | None,
+        *,
+        continuation: bool | None = None,
+    ) -> dict[str, Any]:
         # The failure message rides in body and error is a bare flag — see AGENTS.md.
         frame = chat_response(
             ChatMessageType.USE_CHAT_RESPONSE,
             request_id,
             "" if error is None else error,
             done=True,
+            continuation=(
+                self._is_continuation_request(request_id)
+                if continuation is None
+                else continuation
+            ),
         )
 
         if error is not None:
@@ -1585,25 +2768,42 @@ class AIChatAgent(Agent):
         self,
         request_id: str,
         error: str | None = None,
-    ) -> None:
+        *,
+        continuation: bool | None = None,
+        dedupe: bool = True,
+    ) -> bool:
         # Not buffered: replay synthesizes its own terminal, so storing this would
         # append a second one on resume.
+        if dedupe and request_id in self._terminal_request_ids:
+            return False
+        if dedupe:
+            self._terminal_request_ids.add(request_id)
         if error is not None:
             self._child_agent_tool_runs.capture_error(request_id, error)
         self.broadcast_json(
-            self._terminal_frame(request_id, error),
+            self._terminal_frame(request_id, error, continuation=continuation),
             exclude=self._pending_resume_connections,
         )
+        return True
 
     def _send_terminal(
         self,
         connection: Connection,
         request_id: str,
         error: str | None = None,
-    ) -> None:
+        *,
+        continuation: bool | None = None,
+        dedupe: bool = True,
+    ) -> bool:
         # Unicast, for a failure before the stream is registered: no stream exists to
         # buffer against and only the requester is waiting.
-        connection.send_if_open(self._terminal_frame(request_id, error))
+        if dedupe and request_id in self._terminal_request_ids:
+            return False
+        if dedupe:
+            self._terminal_request_ids.add(request_id)
+        return connection.send_if_open(
+            self._terminal_frame(request_id, error, continuation=continuation)
+        )
 
     # -- child agent-tool adapter ---------------------------------------
 

@@ -3,53 +3,24 @@ from __future__ import annotations
 import asyncio
 import inspect
 import traceback
-import workers
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
+from contextvars import ContextVar
 from datetime import datetime
 from types import CoroutineType
 from typing import Any, Literal, TypeVar, cast
 
+import workers
 from js import Object  # ty: ignore[unresolved-import]
 from js import Request as JsRequest  # ty: ignore[unresolved-import]
 from pyodide.ffi import create_proxy, to_js
 from workers import DurableObject, Request, Response
 
-from ._discovery import static_mro_members
-from .agent_tools import AgentToolResult, AgentToolRuns
-from .connection_state import (
-    CF_NO_PROTOCOL_KEY,
-    CF_READONLY_KEY,
-    set_connection_state_flag,
-)
-from .schema import (
-    CORE_SCHEMA_VERSION,
-    parse_schema_version,
-    prepare_core_schema,
-    prepare_core_state_schema,
-    read_core_schema_version,
-)
-from .error import HookError, RoutingException, RPCError
-from .facets import (
-    FACET_ID_PREFIX,
-    SUB_PREFIX,
-    _FACET_KEY_SEP,
-    _FacetOperationGate,
-    _LifecycleRouteStaleWire,
-    _LifecycleRouteValueWire,
-    _StaleLifecycleRoute,
-    _agent_path_from_value,
-    _agent_route_address,
-    _facet_identity,
-    _facet_key,
-    _facet_logical_name,
-    _next_sub_hop,
-    _parse_parent_path,
-    _path_step,
-    _route_address_path,
-    _route_envelope_from_wire,
-    _route_envelope_to_wire,
-    _route_rpc_result,
+from ..lifecycle import (
+    Lifecycle,
+    LifecycleMemoryLimitContext,
+    LifecycleRouteAddress,
+    LifecycleRouteEnvelope,
 )
 from ..lifecycle.fiber import (
     FiberCapability,
@@ -59,11 +30,69 @@ from ..lifecycle.fiber import (
     FiberRecoveryResult,
     StartFiberResult,
 )
-from ..lifecycle import (
-    Lifecycle,
-    LifecycleMemoryLimitContext,
-    LifecycleRouteAddress,
-    LifecycleRouteEnvelope,
+from ..lifecycle.websockets import (
+    Connection,
+    ConnectionContext,
+    JsonT,
+    WebSockets,
+    _current_websocket_connection,
+    _prepare_tags,
+)
+from ..mcp.client import MCPClientManager, RPCTransportAdapter
+from ..schedules import (
+    Schedule,
+    ScheduleCriteria,
+    ScheduleOptions,
+    Scheduler,
+    _discover_scheduler_callbacks,
+)
+from ..tasks import Tasks, _discover_task_definitions
+from ..workflows import (
+    AgentWorkflowFacetOrigin,
+    AgentWorkflowPathStep,
+    AgentWorkflowRootOrigin,
+    RunWorkflowOptions,
+    WorkflowCallback,
+    WorkflowCallbackHandlers,
+    WorkflowEventPayload,
+    WorkflowInfo,
+    WorkflowInstanceStatus,
+    WorkflowMetadataScalar,
+    WorkflowOperations,
+    WorkflowPage,
+    WorkflowQueryCriteria,
+    WorkflowStatus,
+    decode_workflow_callback,
+)
+from ._discovery import deferred_method, static_definition_function, static_mro_members
+from ._wire import strict_json_loads
+from .agent_tools import AgentToolResult, AgentToolRuns
+from .connection_state import (
+    CF_NO_PROTOCOL_KEY,
+    CF_READONLY_KEY,
+    set_connection_state_flag,
+)
+from .error import HookError, RoutingException, RPCError
+from .facets import (
+    _FACET_KEY_SEP,
+    FACET_ID_PREFIX,
+    SUB_PREFIX,
+    _agent_path_from_value,
+    _agent_route_address,
+    _facet_identity,
+    _facet_key,
+    _facet_logical_name,
+    _FacetOperationGate,
+    _LifecycleRouteStaleWire,
+    _LifecycleRouteValueWire,
+    _next_sub_hop,
+    _parse_parent_path,
+    _path_step,
+    _route_address_path,
+    _route_envelope_from_wire,
+    _route_envelope_to_wire,
+    _route_rpc_result,
+    _StaleLifecycleRoute,
 )
 from .protocol import (
     McpServers,
@@ -87,26 +116,25 @@ from .routing import (
     route_agent_request,
 )
 from .rpc import (
-    _RPC_Func,
     _bind_rpc_member,
+    _RPC_Func,
     _rpc_metadata,
     _static_callable,
     rpc_callable,
 )
-from ..schedules import (
-    Schedule,
-    ScheduleCriteria,
-    ScheduleOptions,
-    Scheduler,
-    _discover_scheduler_callbacks,
+from .schema import (
+    CORE_SCHEMA_VERSION,
+    parse_schema_version,
+    prepare_core_schema,
+    prepare_core_state_schema,
+    read_core_schema_version,
 )
 from .subagent_relay import (
     BufferedRelayConnection,
+    RelayPathStep,
     RelaySession,
     RelayTarget,
 )
-from ..tasks import Tasks, _discover_task_definitions
-from ._wire import strict_json_loads
 from .utils import (
     MISSING,
     dumps_wire,
@@ -116,15 +144,6 @@ from .utils import (
     url_path,
     url_with_path,
 )
-from ..lifecycle.websockets import (
-    Connection,
-    ConnectionContext,
-    JsonT,
-    WebSockets,
-    _current_websocket_connection,
-    _prepare_tags,
-)
-
 
 _T = TypeVar("_T")
 
@@ -143,6 +162,11 @@ async def _call_maybe_async(fn: Callable[..., Any], *args: Any) -> Any:
     return result
 
 
+def _rpc_to_python(value: object) -> object:
+    to_python = getattr(value, "to_py", None)
+    return to_python() if callable(to_python) else value
+
+
 # "server" for server-initiated updates, or the Connection that sent the frame
 StateSourceT = Connection | Literal["server"]
 
@@ -151,13 +175,59 @@ STATE_ROW_ID = "cf_state_row_id"
 PARENT_PATH_ROW_ID = "cf_parent_path"
 _RUNTIME_ENTRY_POINTS = frozenset(
     {
+        "_cf_broadcastAgentPath",
+        "_cf_invokeAgentPath",
         "_cf_route_lifecycle",
+        "_workflow_broadcast",
+        "_workflow_handleCallback",
+        "_workflow_updateState",
         "alarm",
         "webSocketMessage",
         "webSocketClose",
         "webSocketError",
     }
 )
+
+
+class _AgentMCPBindingResolver:
+    def __init__(self, env: object) -> None:
+        self._env = env
+
+    async def resolve(
+        self,
+        binding_name: str,
+        name: str,
+        props: Mapping[str, Any] | None,
+    ) -> object:
+        namespace = (
+            self._env.get(binding_name)
+            if isinstance(self._env, Mapping)
+            else getattr(self._env, binding_name, None)
+        )
+        id_from_name = getattr(namespace, "idFromName", None)
+        get = getattr(namespace, "get", None)
+        if not callable(id_from_name) or not callable(get):
+            raise ValueError(f'MCP Durable Object binding "{binding_name}" not found')
+
+        stub = get(id_from_name(f"rpc:{name}"))
+        try:
+            initialize = getattr(stub, "__unsafe_ensureInitialized", None)
+            if callable(initialize):
+                if props is None:
+                    await _call_maybe_async(initialize)
+                else:
+                    await _call_maybe_async(initialize, dict(props))
+            return stub
+        except BaseException:
+            destroy = getattr(stub, "destroy", None)
+            if callable(destroy):
+                try:
+                    cleanup = destroy()
+                    if inspect.isawaitable(cleanup):
+                        await cleanup
+                except Exception:
+                    pass
+            raise
 
 
 def _parse_version(raw: Any) -> int:
@@ -198,6 +268,12 @@ class Agent(DurableObject):
         self.__rpc_meths: dict[str, _RPC_Func] = {}
         self.__rpc_class_callables: set[str] = set()
         self.__handshake_state_connections: set[Connection] = set()
+        self.__mcp_broadcast_ready = False
+        self.__facet_startup_protocol_pending: tuple[str, str] | None = None
+        self.__relay_startup_context: ContextVar[tuple[str, str] | None] = ContextVar(
+            "agent_relay_startup_context",
+            default=None,
+        )
 
         # None means "not read yet": the ancestor chain loads on first use, keeping it
         # off the constructor path.
@@ -236,13 +312,30 @@ class Agent(DurableObject):
             _discover_task_definitions(self, members),
             on_error=self._report_tasks_error,
         )
+        self.mcp = MCPClientManager(
+            type(self).__name__,
+            "0.1.0",
+            transports={"rpc": RPCTransportAdapter(_AgentMCPBindingResolver(env))},
+        )
+        self.mcp.add_state_listener(lambda: self._publish_mcp_state_change())
+        self._workflows = WorkflowOperations.for_agent(
+            self.sql,
+            self.env,
+            lambda agent_binding: Agent._workflow_origin(self, agent_binding),
+            callbacks=WorkflowCallbackHandlers(
+                on_progress=lambda *args: self.on_workflow_progress(*args),
+                on_complete=lambda *args: self.on_workflow_complete(*args),
+                on_error=lambda *args: self.on_workflow_error(*args),
+                on_event=lambda *args: self.on_workflow_event(*args),
+            ),
+        )
 
         self._websockets = WebSockets(
             on_connect=self._dispatch_connect,
             on_message=self._dispatch_message,
             on_close=self._dispatch_close,
-            on_error=self.on_error,
-            get_connection_tags=self.get_connection_tags,
+            on_error=lambda *args: self.on_error(*args),
+            get_connection_tags=lambda *args: self.get_connection_tags(*args),
             socket_source=self._owned_websockets,
             ensure_ready=self._ensure_initialized,
             before_upgrade=self._before_websocket_upgrade,
@@ -273,6 +366,7 @@ class Agent(DurableObject):
         )
         self._lifecycle.use(self.scheduler)
         self._lifecycle.use(self.tasks)
+        self._lifecycle.use(self.mcp)
         self._lifecycle.use(self._websockets, fallback=True)
         self._connections = self._websockets._connections
 
@@ -393,6 +487,8 @@ class Agent(DurableObject):
                 payload=envelope.payload,
             )
 
+        # TODO: this definitely needs to be made clearer
+
         next_step = target_path[len(self_path)]
         class_name = next_step["className"]
         name = next_step["name"]
@@ -477,8 +573,16 @@ class Agent(DurableObject):
         return None
 
     def _websocket_relay_target_is_valid(self, target: RelayTarget) -> bool:
-        hop = _next_sub_hop(url_path(target["url"]), is_child=False)
-        return hop is not None and _FACET_KEY_SEP not in hop[1]
+        if "path" not in target:
+            hop = _next_sub_hop(url_path(target["url"]), is_child=False)
+            return hop is not None and _FACET_KEY_SEP not in hop[1]
+        path = self._relay_target_path(target)
+        self_path = self.self_path
+        return (
+            path is not None
+            and len(path) > len(self_path)
+            and path[: len(self_path)] == self_path
+        )
 
     async def _forward_websocket_relay(self, payload: dict[str, Any]) -> str:
         return await self._forward_ws_relay(payload, gate=False)
@@ -595,7 +699,47 @@ class Agent(DurableObject):
         return {}
 
     def get_mcp_servers(self) -> McpServers:
-        return McpServers(servers={}, tools=[], prompts=[], resources=[])
+        if not self.mcp._started:
+            return McpServers(servers={}, tools=[], prompts=[], resources=[])
+        return self.mcp.get_mcp_servers()
+
+    async def add_mcp_server(
+        self,
+        server_id: str,
+        *,
+        url: str,
+        name: str,
+        callback_url: str = "",
+        client_id: str | None = None,
+        client: Mapping[str, Any] | None = None,
+        transport: Mapping[str, Any] | None = None,
+        retry: Mapping[str, Any] | None = None,
+        binding_name: str | None = None,
+        props: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Register and connect one HTTP or RPC MCP server."""
+
+        await self._ensure_initialized()
+        registered_id = await self.mcp.register_server(
+            server_id,
+            url=url,
+            name=name,
+            callback_url=callback_url,
+            client_id=client_id,
+            client=client,
+            transport=transport,
+            retry=retry,
+            binding_name=binding_name,
+            props=props,
+        )
+        result = await self.mcp.connect_to_server(registered_id)
+        return {"id": registered_id, **result}
+
+    async def remove_mcp_server(self, server_id: str) -> None:
+        """Remove a durable MCP server registration and its live connection."""
+
+        await self._ensure_initialized()
+        await self.mcp.remove_server(server_id)
 
     def should_connection_be_readonly(
         self,
@@ -650,8 +794,18 @@ class Agent(DurableObject):
         raise error
 
     async def _lifecycle_host_start(self) -> None:
+        if self._facet_name is None:
+            self._broadcast_mcp_servers()
+            self.__mcp_broadcast_ready = True
         await self._retry_pending_facet_deletions()
         await self._dispatch_hook("on_start", self.on_start, propagate=True)
+        if self._facet_name is not None:
+            self.__mcp_broadcast_ready = True
+            startup = self.__relay_startup_context.get()
+            if startup is not None:
+                self.__facet_startup_protocol_pending = startup
+            else:
+                self._retain_facet_protocol_snapshot(())
 
     async def _lifecycle_host_request(self, request: Request) -> Response:
         return await self._dispatch_hook(
@@ -809,6 +963,254 @@ class Agent(DurableObject):
         ctx: ConnectionContext,
     ) -> list[str]:
         return []
+
+    def _workflow_origin(
+        self,
+        agent_binding: str | None,
+    ) -> AgentWorkflowRootOrigin | AgentWorkflowFacetOrigin:
+        path = self.self_path
+        root = path[0]
+        binding = agent_binding or self._find_agent_binding_name(root["className"])
+        if binding is None:
+            raise ValueError(
+                "Could not detect Agent binding name from class name. "
+                "Pass it explicitly via RunWorkflowOptions.agent_binding"
+            )
+        if self._facet_name is None:
+            return AgentWorkflowRootOrigin(binding=binding, name=self.name)
+        return AgentWorkflowFacetOrigin(
+            root_binding=binding,
+            path=tuple(
+                AgentWorkflowPathStep(
+                    class_name=step["className"],
+                    name=step["name"],
+                )
+                for step in path
+            ),
+        )
+
+    def _find_agent_binding_name(self, class_name: str) -> str | None:
+        expected = camel_to_kebab(class_name)
+        env = getattr(self.env, "_env", self.env)
+        try:
+            keys = Object.keys(env)
+        except Exception:  # noqa: BLE001
+            return None
+        for raw_key in keys:
+            key = str(raw_key)
+            if camel_to_kebab(key) != expected:
+                continue
+            try:
+                value = env.get(key) if isinstance(env, Mapping) else getattr(env, key)
+            except Exception:  # noqa: BLE001
+                continue
+            if callable(getattr(value, "idFromName", None)):
+                return key
+        return None
+
+    async def run_workflow(
+        self,
+        workflow_name: str,
+        params: Mapping[str, object],
+        options: RunWorkflowOptions | None = None,
+    ) -> str:
+        """Start and track a native Workflow from this Agent or facet."""
+
+        await self._ensure_initialized()
+        return await self._workflows.run_workflow(workflow_name, params, options)
+
+    def get_workflow(self, workflow_id: str) -> WorkflowInfo | None:
+        """Return one locally tracked Workflow."""
+
+        return self._workflows.get_workflow(workflow_id)
+
+    def get_workflows(
+        self,
+        criteria: WorkflowQueryCriteria | None = None,
+    ) -> WorkflowPage:
+        """Return a page of locally tracked Workflows."""
+
+        return self._workflows.get_workflows(criteria)
+
+    async def get_workflow_status(
+        self,
+        workflow_name: str,
+        workflow_id: str,
+    ) -> WorkflowInstanceStatus:
+        """Refresh and return a native Workflow's status."""
+
+        await self._ensure_initialized()
+        return await self._workflows.get_workflow_status(workflow_name, workflow_id)
+
+    async def send_workflow_event(
+        self,
+        workflow_name: str,
+        workflow_id: str,
+        event: WorkflowEventPayload,
+    ) -> None:
+        """Send an event to a native Workflow instance."""
+
+        await self._ensure_initialized()
+        await self._workflows.send_workflow_event(workflow_name, workflow_id, event)
+
+    async def approve_workflow(
+        self,
+        workflow_id: str,
+        *,
+        reason: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> None:
+        """Approve a Workflow waiting for the standard approval event."""
+
+        await self._ensure_initialized()
+        await self._workflows.approve_workflow(
+            workflow_id,
+            reason=reason,
+            metadata=metadata,
+        )
+
+    async def reject_workflow(
+        self,
+        workflow_id: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """Reject a Workflow waiting for the standard approval event."""
+
+        await self._ensure_initialized()
+        await self._workflows.reject_workflow(workflow_id, reason=reason)
+
+    async def pause_workflow(self, workflow_id: str) -> None:
+        """Pause a locally tracked Workflow."""
+
+        await self._ensure_initialized()
+        await self._workflows.pause_workflow(workflow_id)
+
+    async def resume_workflow(self, workflow_id: str) -> None:
+        """Resume a locally tracked Workflow."""
+
+        await self._ensure_initialized()
+        await self._workflows.resume_workflow(workflow_id)
+
+    async def terminate_workflow(self, workflow_id: str) -> None:
+        """Terminate a locally tracked Workflow."""
+
+        await self._ensure_initialized()
+        await self._workflows.terminate_workflow(workflow_id)
+
+    async def restart_workflow(
+        self,
+        workflow_id: str,
+        *,
+        reset_tracking: bool = True,
+    ) -> None:
+        """Restart a locally tracked Workflow."""
+
+        await self._ensure_initialized()
+        await self._workflows.restart_workflow(
+            workflow_id,
+            reset_tracking=reset_tracking,
+        )
+
+    def delete_workflow(self, workflow_id: str) -> bool:
+        """Delete one local Workflow tracking row."""
+
+        return self._workflows.delete_workflow(workflow_id)
+
+    def delete_workflows(
+        self,
+        *,
+        status: WorkflowStatus | Sequence[WorkflowStatus] | None = None,
+        workflow_name: str | None = None,
+        metadata: Mapping[str, WorkflowMetadataScalar] | None = None,
+        created_before: datetime | None = None,
+    ) -> int:
+        """Delete local Workflow tracking rows matching exact filters."""
+
+        return self._workflows.delete_workflows(
+            status=status,
+            workflow_name=workflow_name,
+            metadata=metadata,
+            created_before=created_before,
+        )
+
+    def migrate_workflow_binding(self, old_name: str, new_name: str) -> int:
+        """Rename a Workflow binding in retained tracking rows."""
+
+        return self._workflows.migrate_workflow_binding(old_name, new_name)
+
+    async def on_workflow_callback(self, callback: WorkflowCallback) -> None:
+        """Apply one Workflow callback and dispatch its specific hook."""
+
+        await self._workflows.handle_callback(callback)
+
+    async def on_workflow_progress(
+        self,
+        workflow_name: str,
+        workflow_id: str,
+        progress: object,
+    ) -> None: ...
+
+    async def on_workflow_complete(
+        self,
+        workflow_name: str,
+        workflow_id: str,
+        result: object | None,
+    ) -> None: ...
+
+    async def on_workflow_error(
+        self,
+        workflow_name: str,
+        workflow_id: str,
+        error: str,
+    ) -> None:
+        print(f"Workflow error [{workflow_name}/{workflow_id}]: {error}")
+
+    async def on_workflow_event(
+        self,
+        workflow_name: str,
+        workflow_id: str,
+        event: object,
+    ) -> None: ...
+
+    async def _workflow_handleCallback(self, callback: object) -> None:
+        await self._ensure_initialized()
+        value = _rpc_to_python(callback)
+        if not isinstance(value, Mapping):
+            raise TypeError("Workflow callback must be an object")
+        decoded = decode_workflow_callback(value)
+        await _call_maybe_async(self.on_workflow_callback, decoded)
+
+    async def _workflow_broadcast(self, message: object) -> None:
+        await self._ensure_initialized()
+        payload = dumps_wire(_rpc_to_python(message))
+        if self._facet_name is None:
+            self.broadcast(payload)
+            return
+        await self._root_agent_stub()._cf_broadcastAgentPath(self.self_path, payload)
+
+    async def _workflow_updateState(
+        self,
+        action: str,
+        state: object = MISSING,
+    ) -> None:
+        await self._ensure_initialized()
+        value = _rpc_to_python(state)
+        if action == "reset":
+            initial = self.initial_state()
+            if not isinstance(initial, dict):
+                raise TypeError("initial_state must return an object")
+            self.set_state(initial)
+            return
+        if not isinstance(value, dict):
+            raise TypeError("Workflow state updates must contain an object")
+        if action == "set":
+            self.set_state(value)
+            return
+        if action == "merge":
+            self.set_state({**self.state, **value})
+            return
+        raise ValueError(f"Unknown Workflow state action: {action!r}")
 
     async def _dispatch_request(self, request: Request) -> Response:
         return await _call_maybe_async(self.on_request, request)
@@ -1077,16 +1479,156 @@ class Agent(DurableObject):
                 forwarded_url = url_with_path(decision.url, remaining)
                 headers = dict(decision.headers)
 
-        child = await self._resolve_sub_agent(class_name, child_name)
+        relay_id = payload.get("relayId")
+        event = payload.get("event")
+        context = (
+            (relay_id, event)
+            if isinstance(relay_id, str) and isinstance(event, str)
+            else None
+        )
+        token = self.__relay_startup_context.set(context)
+        try:
+            child = await self._resolve_sub_agent(class_name, child_name)
+        finally:
+            self.__relay_startup_context.reset(token)
         forwarded = {**payload, "url": forwarded_url, "headers": headers}
         return await child._cf_ws_event(dumps_wire(forwarded))
 
     async def _cf_ws_event(self, payload_json: str) -> str:
-        await self._ensure_initialized()
         payload = loads_dict_or_none(payload_json)
         if payload is None:
             raise RoutingException("invalid sub-agent relay payload")
+        relay_id = payload.get("relayId")
+        event = payload.get("event")
+        context = (
+            (relay_id, event)
+            if isinstance(relay_id, str) and isinstance(event, str)
+            else None
+        )
+        token = self.__relay_startup_context.set(context)
+        try:
+            await self._ensure_initialized()
+        finally:
+            self.__relay_startup_context.reset(token)
         return await self._forward_ws_relay(payload, gate=True)
+
+    async def _cf_invokeAgentPath(
+        self,
+        target_path: object,
+        method: object,
+        args: object,
+    ) -> object:
+        await self._ensure_initialized()
+        target = _agent_path_from_value(_rpc_to_python(target_path))
+        method = _rpc_to_python(method)
+        args = _rpc_to_python(args)
+        if not isinstance(method, str) or not isinstance(args, list):
+            raise TypeError("Workflow path RPC requires a method and argument list")
+
+        self_path = self.self_path
+        if target[: len(self_path)] != self_path:
+            raise ValueError(
+                f"Workflow origin path does not descend from {self_path!r}"
+            )
+        if len(target) == len(self_path):
+            member = static_mro_members(self).get(method)
+            if method.startswith("__") or static_definition_function(member) is None:
+                raise ValueError(
+                    f'Workflow origin method "{method}" is not callable on '
+                    f"{type(self).__name__}"
+                )
+            callback = deferred_method(member, self)
+            return await _call_maybe_async(callback, *args)
+
+        next_step = target[len(self_path)]
+        class_name = next_step["className"]
+        name = next_step["name"]
+        if not self._has_sub_agent_row(class_name, name):
+            raise ValueError(
+                f'Workflow origin sub-agent {class_name} "{name}" no longer exists'
+            )
+        child = await self._resolve_sub_agent(class_name, name)
+        return await _call_maybe_async(
+            child._cf_invokeAgentPath,
+            target,
+            method,
+            args,
+        )
+
+    async def _cf_broadcastAgentPath(
+        self,
+        target_path: object,
+        message: object,
+        exclude: object = (),
+        protocol: object = False,
+    ) -> None:
+        await self._ensure_initialized()
+        if self._facet_name is not None:
+            raise ValueError("facet broadcasts must be routed through the root Agent")
+
+        target = _agent_path_from_value(_rpc_to_python(target_path))
+        message = _rpc_to_python(message)
+        excluded = _rpc_to_python(exclude)
+        protocol = _rpc_to_python(protocol)
+        if not isinstance(message, str):
+            raise TypeError("facet broadcast message must be a string")
+        if not isinstance(excluded, (list, tuple)) or not all(
+            isinstance(value, str) for value in excluded
+        ):
+            raise TypeError("facet broadcast exclusions must be physical relay keys")
+        if not isinstance(protocol, bool):
+            raise TypeError("facet protocol broadcast marker must be a boolean")
+
+        self_path = self.self_path
+        if target[: len(self_path)] != self_path or len(target) == len(self_path):
+            raise ValueError(
+                f"facet broadcast path does not descend from {self_path!r}"
+            )
+
+        def matches(relay: RelayTarget, connection: Connection) -> bool:
+            return self._relay_target_path(relay) == target and (
+                not protocol
+                or (
+                    connection not in self.__handshake_state_connections
+                    and self.is_connection_protocol_enabled(connection)
+                )
+            )
+
+        await self._websockets._broadcast_relays(message, matches, exclude=excluded)
+
+    def _relay_target_path(self, target: RelayTarget) -> list[PathStep] | None:
+        stored_path = target.get("path")
+        stored = (
+            [_path_step(step["className"], step["name"]) for step in stored_path]
+            if stored_path is not None
+            else None
+        )
+        path = self.self_path
+        if stored is not None and stored[: len(path)] != path:
+            return None
+        remaining = url_path(target["url"])
+        is_child = False
+        while True:
+            hop = _next_sub_hop(remaining, is_child=is_child)
+            if hop is None:
+                reconstructed = path if is_child else None
+                if stored is None:
+                    return reconstructed
+                return stored if stored == reconstructed else None
+            kebab, name, remaining = hop
+            if stored is None:
+                class_name = self._resolve_child_class(kebab)
+                if class_name is None:
+                    return None
+            else:
+                if len(path) >= len(stored):
+                    return None
+                step = stored[len(path)]
+                if camel_to_kebab(step["className"]) != kebab or step["name"] != name:
+                    return None
+                class_name = step["className"]
+            path.append(_path_step(class_name, name))
+            is_child = True
 
     async def _handle_ws_relay_leaf(self, payload: dict[str, Any]) -> str:
         connection_id = payload.get("connectionId")
@@ -1103,6 +1645,7 @@ class Agent(DurableObject):
         relay_tags = tags if isinstance(tags, list) else []
         connection = BufferedRelayConnection(
             connection_id,
+            physical_key=relay_id,
             state=state,
             tags=[tag for tag in relay_tags if isinstance(tag, str)],
             max_frames=self.sub_agent_ws_max_frames,
@@ -1163,6 +1706,10 @@ class Agent(DurableObject):
                 await self._report_error(error, relay_connection)
             else:
                 raise RoutingException("unknown sub-agent relay event")
+            if self.__facet_startup_protocol_pending == (relay_id, event):
+                self.__facet_startup_protocol_pending = None
+                excluded = (relay_id,) if event == "connect" else ()
+                self._retain_facet_protocol_snapshot(excluded)
             return connection.operation_log()
 
     async def _handle_rpc(self, connection: Connection, data: dict[str, Any]):
@@ -1260,17 +1807,61 @@ class Agent(DurableObject):
         *,
         exclude: Connection | None = None,
     ) -> None:
+        relay_exclusions: list[str] = []
         for connection in self.get_connections():
+            physical_key = getattr(connection, "_physical_key", None)
             if (
                 connection is exclude
                 or connection in self.__handshake_state_connections
                 or not self.is_connection_protocol_enabled(connection)
             ):
+                if connection is exclude and isinstance(physical_key, str):
+                    relay_exclusions.append(physical_key)
                 continue
             connection.send_if_open(frame)
+            if isinstance(physical_key, str):
+                relay_exclusions.append(physical_key)
+        if self._facet_name is not None and self.__mcp_broadcast_ready:
+            target = self.self_path
+            payload = dumps_wire(frame)
+            self._lifecycle._retain_work(
+                lambda: self._root_agent_stub()._cf_broadcastAgentPath(
+                    target,
+                    payload,
+                    relay_exclusions,
+                    True,
+                )
+            )
+
+    def _retain_facet_protocol_snapshot(self, excluded: Iterable[str]) -> None:
+        target = self.self_path
+        state_payload = dumps_wire(state_frame(self.state))
+        mcp_payload = dumps_wire(mcp_servers_frame(self.get_mcp_servers()))
+        relay_exclusions = list(excluded)
+
+        async def publish() -> None:
+            root = self._root_agent_stub()
+            await root._cf_broadcastAgentPath(
+                target,
+                state_payload,
+                relay_exclusions,
+                True,
+            )
+            await root._cf_broadcastAgentPath(
+                target,
+                mcp_payload,
+                relay_exclusions,
+                True,
+            )
+
+        self._lifecycle._retain_work(publish)
 
     def _broadcast_mcp_servers(self) -> None:
         self._broadcast_protocol(mcp_servers_frame(self.get_mcp_servers()))
+
+    def _publish_mcp_state_change(self) -> None:
+        if self.__mcp_broadcast_ready:
+            self._broadcast_mcp_servers()
 
     @property
     def state(self) -> dict[str, Any]:
@@ -1309,7 +1900,13 @@ class Agent(DurableObject):
 
         return _parse_parent_path(raw)
 
-    async def _cf_init_as_facet(self, name: str, parent_path_json: str) -> None:
+    async def _cf_init_as_facet(
+        self,
+        name: str,
+        parent_path_json: str,
+        relay_id: str | None = None,
+        relay_event: str | None = None,
+    ) -> None:
         # Reached over RPC from the parent, so it runs inside this object's own isolate
         # and owns its storage writes. Deliberately not decorated: browser RPC must not
         # expose this internal bootstrap method.
@@ -1325,9 +1922,16 @@ class Agent(DurableObject):
         self.__parent_path = _parse_parent_path(parent_path_json)
         self._configure_lifecycle_routes()
 
-        # This RPC bypasses fetch(), which is what normally runs on_start, so without
-        # this the child would serve its first real call unconfigured.
-        await self._ensure_initialized()
+        context = (
+            (relay_id, relay_event)
+            if isinstance(relay_id, str) and isinstance(relay_event, str)
+            else None
+        )
+        token = self.__relay_startup_context.set(context)
+        try:
+            await self._ensure_initialized()
+        finally:
+            self.__relay_startup_context.reset(token)
 
     def _ensure_sub_agent_registry(self) -> None:
         # Lazy and outside the schema marker, so an agent that never spawns a child
@@ -1448,7 +2052,18 @@ class Agent(DurableObject):
                 existed = self._has_sub_agent_row(class_name, name)
                 self._record_sub_agent(class_name, name)
                 try:
-                    await stub._cf_init_as_facet(name, dumps_wire(parent_path))
+                    relay_context = self.__relay_startup_context.get()
+                    args = (
+                        (name, dumps_wire(parent_path))
+                        if relay_context is None
+                        else (
+                            name,
+                            dumps_wire(parent_path),
+                            relay_context[0],
+                            relay_context[1],
+                        )
+                    )
+                    await stub._cf_init_as_facet(*args)
                 except BaseException:
                     if not existed:
                         self._forget_sub_agent(class_name, name)
@@ -1767,6 +2382,12 @@ class Agent(DurableObject):
                 url=url_with_path(forwarded.url, path),
                 headers=dict(forwarded.headers),
             )
+            target_path = self._relay_target_path(target)
+            if target_path is not None:
+                target["path"] = [
+                    RelayPathStep(className=step["className"], name=step["name"])
+                    for step in target_path
+                ]
             self.__pending_relay_targets[id(forwarded)] = target
             try:
                 return await self._lifecycle.websocket_upgrade(forwarded)

@@ -29,6 +29,7 @@ def chat_response(
     done: bool,
     replay: bool = False,
     replay_complete: bool = False,
+    continuation: bool = False,
 ) -> FrameT:
     # replay and replayComplete are omitted rather than sent false, matching what a live
     # turn puts on the wire.
@@ -42,6 +43,8 @@ def chat_response(
         frame["replay"] = True
     if replay_complete:
         frame["replayComplete"] = True
+    if continuation:
+        frame["continuation"] = True
     return frame
 
 
@@ -68,9 +71,13 @@ def stream_resuming_frame(request_id: str, probe_id: Any = None) -> FrameT:
     return frame
 
 
-def stream_resume_none_frame(probe_id: Any = None) -> FrameT:
+def stream_resume_none_frame(
+    probe_id: Any = None,
+    *,
+    reason: str = "idle",
+) -> FrameT:
     # "idle" tells the client no stream exists, so it clears its loading state.
-    frame: FrameT = {"type": ChatMessageType.STREAM_RESUME_NONE, "reason": "idle"}
+    frame: FrameT = {"type": ChatMessageType.STREAM_RESUME_NONE, "reason": reason}
     if probe_id is not None:
         frame["probeId"] = probe_id
     return frame

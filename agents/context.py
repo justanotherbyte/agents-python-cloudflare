@@ -11,7 +11,6 @@ from ._context_shaping import _shape_messages
 from ._session_json import dumps_session_json
 from .sessions import SessionMessage
 
-
 _JS_WHITESPACE = re.compile(
     "[\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a"
     "\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]+"

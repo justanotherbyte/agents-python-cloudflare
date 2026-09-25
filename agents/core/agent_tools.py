@@ -131,8 +131,8 @@ class AgentToolRuns:
         sql: _SqlFn,
         publish: Callable[[dict[str, Any]], None],
         resolve_sub_agent: Callable[[str, str], Awaitable[ChildAgentToolStub]],
-        max_concurrent: Callable[[], int],
-        recovery_grace_ms: Callable[[], int],
+        max_concurrent: Callable[[], int],  # TODO: does this need to be a callable?
+        recovery_grace_ms: Callable[[], int],  # TODO: does this need to be a callable?
     ) -> None:
         self._sql = sql
         self._publish = publish

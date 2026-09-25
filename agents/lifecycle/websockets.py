@@ -22,7 +22,12 @@ from ..core.connection_state import (
     merge_connection_state,
 )
 from ..core.error import HookError
-from ..core.subagent_relay import RelayLimits, RelayTarget, relay_round_trip
+from ..core.subagent_relay import (
+    RelayLimits,
+    RelayPathStep,
+    RelayTarget,
+    relay_round_trip,
+)
 from ..core.utils import gen_id
 from .capability import LifecycleCapability
 from .types import (
@@ -90,7 +95,25 @@ def _decode_relay_target(value: object) -> RelayTarget | None:
         isinstance(key, str) and isinstance(item, str) for key, item in headers.items()
     ):
         return None
-    return RelayTarget(url=url, headers=headers)
+    target = RelayTarget(url=url, headers=headers)
+    path = value.get("path")
+    if path is not None:
+        if not isinstance(path, list) or not path:
+            return None
+        decoded_path: list[RelayPathStep] = []
+        for step in path:
+            if (
+                not isinstance(step, dict)
+                or set(step) != {"className", "name"}
+                or not isinstance(step["className"], str)
+                or not isinstance(step["name"], str)
+            ):
+                return None
+            decoded_path.append(
+                RelayPathStep(className=step["className"], name=step["name"])
+            )
+        target["path"] = decoded_path
+    return target
 
 
 @dataclass(slots=True)
@@ -790,6 +813,28 @@ class WebSockets(LifecycleCapability):
         hydrate: bool = True,
     ) -> None:
         self.broadcast(json.dumps(data), exclude=exclude, hydrate=hydrate)
+
+    async def _broadcast_relays(
+        self,
+        data: str,
+        matches: Callable[[RelayTarget, Connection], bool],
+        *,
+        exclude: Iterable[str] = (),
+    ) -> None:
+        self.hydrate()
+        excluded = frozenset(exclude)
+        for connection in self._unique_connections():
+            target = self._relay_target(connection)
+            if (
+                target is not None
+                and connection._physical_key not in excluded
+                and matches(target, connection)
+            ):
+                lock = self._relay_locks.setdefault(
+                    connection._physical_key, asyncio.Lock()
+                )
+                async with lock:
+                    connection.send_if_open(data)
 
     async def _ready(self) -> None:
         if self._ensure_ready is not None:

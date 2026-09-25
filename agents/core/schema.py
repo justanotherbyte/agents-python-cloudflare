@@ -5,7 +5,6 @@ from typing import Any
 
 from ..lifecycle.fiber_schema import prepare_fiber_schema
 
-
 CORE_SCHEMA_VERSION_ROW_ID = "cf_schema_version"
 CORE_SCHEMA_VERSION = 11
 

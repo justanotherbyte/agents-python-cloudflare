@@ -650,55 +650,197 @@ async def test_invalid_tool_answer_frames_are_consumed_without_mutation(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "frame_type",
-    [ChatMessageType.TOOL_RESULT, ChatMessageType.TOOL_APPROVAL],
+    ("frame_type", "auto_continue", "expected_calls"),
+    [
+        (ChatMessageType.TOOL_RESULT, None, 0),
+        (ChatMessageType.TOOL_RESULT, False, 0),
+        (ChatMessageType.TOOL_RESULT, True, 1),
+        (ChatMessageType.TOOL_APPROVAL, True, 1),
+    ],
 )
-async def test_auto_continue_is_currently_ignored_pending_stage_five(
-    frame_type, wait_until
+async def test_auto_continue_starts_one_continuation_after_the_coalesce_window(
+    frame_type,
+    auto_continue,
+    expected_calls,
+    wait_until,
 ):
-    outcomes = []
-    for auto_continue in (None, False, True):
-        provider_calls = 0
+    provider_options = []
 
-        def provider(_options):
-            nonlocal provider_calls
-            provider_calls += 1
-            return "unexpected continuation"
+    def provider(options):
+        provider_options.append(options)
+        return "continued"
 
-        agent = fakes.build_chat_agent(provider)
-        message = _message(
-            state=(
-                "approval-requested"
-                if frame_type == ChatMessageType.TOOL_APPROVAL
-                else "input-available"
-            ),
-            approval={} if frame_type == ChatMessageType.TOOL_APPROVAL else None,
-        )
-        await agent._persist_messages([message])
-        connection = fakes.FakeConnection()
-        _connect(agent, connection)
-        detail = {"toolCallId": "call-1"}
-        if frame_type == ChatMessageType.TOOL_APPROVAL:
-            detail["approved"] = True
-        else:
-            detail["output"] = "result"
-        if auto_continue is not None:
-            detail["autoContinue"] = auto_continue
+    agent = fakes.build_chat_agent(provider)
+    message = _message(
+        state=(
+            "approval-requested"
+            if frame_type == ChatMessageType.TOOL_APPROVAL
+            else "input-available"
+        ),
+        approval={} if frame_type == ChatMessageType.TOOL_APPROVAL else None,
+    )
+    await agent._persist_messages([message])
+    connection = fakes.FakeConnection()
+    observer = fakes.FakeConnection("observer")
+    _connect(agent, connection, observer)
+    detail = {"toolCallId": "call-1"}
+    if frame_type == ChatMessageType.TOOL_APPROVAL:
+        detail["approved"] = True
+    else:
+        detail["output"] = "result"
+    if auto_continue is not None:
+        detail["autoContinue"] = auto_continue
 
-        await _dispatch(agent, connection, frame_type, **detail)
-        await asyncio.sleep(0)
-        outcomes.append(
-            (
-                copy.deepcopy(agent.messages),
-                copy.deepcopy(connection.frames),
-                provider_calls,
-            )
-        )
+    await _dispatch(agent, connection, frame_type, **detail)
+    await asyncio.sleep(0.06)
+    await wait_until.drain()
 
-    assert outcomes[0] == outcomes[1] == outcomes[2]
-    messages, frames, provider_calls = outcomes[0]
-    assert len(messages) == 1
-    assert len(frames) == 1
-    assert frames[0]["type"] == ChatMessageType.MESSAGE_UPDATED
+    assert len(provider_options) == expected_calls
+    assert all(options.continuation is True for options in provider_options)
+    assert len(agent.messages) == 1
+    if expected_calls:
+        assert agent.messages[0]["parts"][-1]["text"] == "continued"
+        responses = [
+            frame
+            for frame in observer.frames
+            if frame.get("type") == ChatMessageType.USE_CHAT_RESPONSE
+        ]
+        assert responses
+        assert all(frame["continuation"] is True for frame in responses)
+
+
+@pytest.mark.asyncio
+async def test_matching_duplicate_tool_result_can_request_auto_continuation(
+    wait_until,
+):
+    provider_calls = 0
+
+    def provider(_options):
+        nonlocal provider_calls
+        provider_calls += 1
+        return "continued"
+
+    agent = fakes.build_chat_agent(provider)
+    message = _message(state="output-available")
+    message["parts"][0]["output"] = "result"
+    await agent._persist_messages([message])
+    connection = fakes.FakeConnection()
+    _connect(agent, connection)
+
+    await _dispatch(
+        agent,
+        connection,
+        ChatMessageType.TOOL_RESULT,
+        toolCallId="call-1",
+        output="result",
+        autoContinue=True,
+    )
+    await asyncio.sleep(0.06)
+    await wait_until.drain()
+
+    assert provider_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_continue_waits_for_every_parallel_tool_answer(wait_until):
+    provider_calls = 0
+
+    def provider(_options):
+        nonlocal provider_calls
+        provider_calls += 1
+        return "continued"
+
+    agent = fakes.build_chat_agent(provider)
+    message = _message()
+    message["parts"].append(
+        {
+            "type": "tool-search",
+            "toolCallId": "call-2",
+            "toolName": "search",
+            "state": "input-available",
+            "input": {"query": "forecast"},
+        }
+    )
+    await agent._persist_messages([message])
+    connection = fakes.FakeConnection()
+    _connect(agent, connection)
+
+    await _dispatch(
+        agent,
+        connection,
+        ChatMessageType.TOOL_RESULT,
+        toolCallId="call-1",
+        output="first",
+        autoContinue=True,
+    )
+    await asyncio.sleep(0.06)
+    await wait_until.drain()
     assert provider_calls == 0
-    assert wait_until.records == []
+
+    await _dispatch(
+        agent,
+        connection,
+        ChatMessageType.TOOL_RESULT,
+        toolCallId="call-2",
+        output="second",
+        autoContinue=True,
+    )
+    await asyncio.sleep(0.06)
+    await wait_until.drain()
+    assert provider_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_auto_continuation_has_one_resume_owner():
+    agent = fakes.build_chat_agent(lambda _options: "continued")
+    await agent._persist_messages([_message()])
+    owner = fakes.FakeConnection("owner")
+    observer = fakes.FakeConnection("observer")
+    _connect(agent, owner, observer)
+
+    await _dispatch(
+        agent,
+        owner,
+        ChatMessageType.TOOL_RESULT,
+        toolCallId="call-1",
+        output="result",
+        autoContinue=True,
+    )
+    agent._handle_resume_request(owner, {"probeId": "owner-probe"})
+    agent._handle_resume_request(observer, {"probeId": "observer-probe"})
+
+    assert owner.frames[-1]["type"] == ChatMessageType.STREAM_PENDING
+    assert observer.frames[-1] == {
+        "type": ChatMessageType.STREAM_RESUME_NONE,
+        "probeId": "observer-probe",
+        "reason": "continuation-owned",
+    }
+    agent._continuation.reset()
+    assert owner.frames[-1] == {
+        "type": ChatMessageType.STREAM_RESUME_NONE,
+        "probeId": "owner-probe",
+        "reason": "idle",
+    }
+
+
+@pytest.mark.asyncio
+async def test_disconnect_releases_pending_continuation_ownership():
+    agent = fakes.build_chat_agent(lambda _options: "continued")
+    await agent._persist_messages([_message()])
+    owner = fakes.FakeConnection("owner")
+    _connect(agent, owner)
+
+    await _dispatch(
+        agent,
+        owner,
+        ChatMessageType.TOOL_RESULT,
+        toolCallId="call-1",
+        output="result",
+        autoContinue=True,
+    )
+    await agent._dispatch_close(owner, 1000, "closed", True)
+
+    assert agent._continuation.pending is not None
+    assert agent._continuation.pending.connection_id is None
+    assert agent._continuation.awaiting_connections == {}
+    agent._continuation.reset()

@@ -91,6 +91,211 @@ async def test_root_owns_socket_and_relays_child_lifecycle(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_root_broadcasts_only_to_sockets_owned_by_addressed_facet():
+    target_url = "https://example.com/agents/agent/root/sub/child-agent/leaf"
+    other_url = "https://example.com/agents/agent/root/sub/child-agent/other"
+
+    def relay_socket(connection_id, url):
+        return fakes.FakeSocket(
+            {
+                "__pk": {
+                    "id": connection_id,
+                    "tags": [connection_id],
+                    "uri": url,
+                },
+                "__user": None,
+                "target": {"url": url, "headers": {}},
+            }
+        )
+
+    target_socket = relay_socket("target", target_url)
+    duplicate_socket = relay_socket("target", target_url)
+    other_socket = relay_socket("other", other_url)
+    root = fakes.build_agent(
+        name="root",
+        websockets=[target_socket, duplicate_socket, other_socket],
+    )
+    root.ctx.exports = {"ChildAgent": object()}
+
+    await root._cf_broadcastAgentPath(
+        [
+            {"className": "Agent", "name": "root"},
+            {"className": "ChildAgent", "name": "leaf"},
+        ],
+        '"from-workflow"',
+    )
+
+    assert target_socket.sent == ['"from-workflow"']
+    assert duplicate_socket.sent == ['"from-workflow"']
+    assert other_socket.sent == []
+
+    target_socket.sent.clear()
+    duplicate_socket.sent.clear()
+    target_connection = next(
+        connection
+        for connection in root._websockets._unique_connections()
+        if connection._server is target_socket
+    )
+    await root._cf_broadcastAgentPath(
+        [
+            {"className": "Agent", "name": "root"},
+            {"className": "ChildAgent", "name": "leaf"},
+        ],
+        '"state-update"',
+        [target_connection._physical_key],
+    )
+
+    assert target_socket.sent == []
+    assert duplicate_socket.sent == ['"state-update"']
+
+
+@pytest.mark.asyncio
+async def test_facet_workflow_broadcast_routes_through_root():
+    child = fakes.build_agent(
+        ChildAgent,
+        name="cf-agents:v2:leaf:0123456789abcdef",
+    )
+    await child._cf_init_as_facet(
+        "leaf",
+        json.dumps([{"className": "Agent", "name": "root"}]),
+    )
+    calls = []
+
+    class RootStub:
+        async def _cf_broadcastAgentPath(self, *args):
+            calls.append(args)
+
+    child._root_agent_stub = lambda: RootStub()
+
+    await child._workflow_broadcast({"status": "ready"})
+
+    assert calls == [
+        (
+            [
+                {"className": "Agent", "name": "root"},
+                {"className": "ChildAgent", "name": "leaf"},
+            ],
+            '{"status":"ready"}',
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_facet_mcp_catalog_broadcast_is_retained_and_routed_through_root(
+    wait_until,
+):
+    child = fakes.build_agent(
+        ChildAgent,
+        name="cf-agents:v2:leaf:0123456789abcdef",
+    )
+    calls = []
+
+    class RootStub:
+        async def _cf_broadcastAgentPath(self, *args):
+            calls.append(args)
+
+    child._root_agent_stub = lambda: RootStub()
+    await child._cf_init_as_facet(
+        "leaf",
+        json.dumps([{"className": "Agent", "name": "root"}]),
+    )
+    await wait_until.drain()
+    assert [(json.loads(call[1])["type"], call[2], call[3]) for call in calls] == [
+        ("cf_agent_state", [], True),
+        ("cf_agent_mcp_servers", [], True),
+    ]
+    calls.clear()
+
+    child.mcp._fire_state_changed()
+    await wait_until.drain()
+
+    assert calls == [
+        (
+            [
+                {"className": "Agent", "name": "root"},
+                {"className": "ChildAgent", "name": "leaf"},
+            ],
+            '{"type":"cf_agent_mcp_servers","mcp":{"servers":{},"tools":[],'
+            '"prompts":[],"resources":[]}}',
+            [],
+            True,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_active_facet_relay_receives_state_broadcast_once(
+    monkeypatch, wait_until
+):
+    class StateChild(Agent):
+        async def on_message(self, connection, message):
+            self.set_state({"message": message})
+
+    root = fakes.build_agent(name="root")
+    child = fakes.build_agent(
+        StateChild,
+        name="cf-agents:v2:leaf:0123456789abcdef",
+    )
+    _wire_root(root, child)
+    child._root_agent_stub = lambda: root
+    await child._cf_init_as_facet("leaf", json.dumps(root.self_path))
+    socket = fakes.FakeSocket()
+    _install_pair(monkeypatch, socket)
+    await root.fetch(_request("/agents/agent/root/sub/child-agent/leaf"))
+    socket.sent.clear()
+
+    await root.webSocketMessage(socket, "hello")
+    await wait_until.drain()
+
+    assert [
+        frame
+        for frame in map(json.loads, socket.sent)
+        if frame.get("type") == "cf_agent_state"
+    ] == [{"type": "cf_agent_state", "state": {"message": "hello"}}]
+
+
+@pytest.mark.asyncio
+async def test_facet_on_start_state_uses_connect_handshake_without_duplicate(
+    monkeypatch, wait_until
+):
+    class StartupChild(Agent):
+        async def on_start(self):
+            self.set_state({"started": True})
+
+    root = fakes.build_agent(name="root")
+    child = fakes.build_agent(
+        StartupChild,
+        name="cf-agents:v2:leaf:0123456789abcdef",
+    )
+    _wire_root(root, child)
+    calls = []
+
+    class RootStub:
+        async def _cf_broadcastAgentPath(self, *args):
+            calls.append(args)
+
+    child._root_agent_stub = lambda: RootStub()
+    socket = fakes.FakeSocket()
+    _install_pair(monkeypatch, socket)
+
+    await root.fetch(_request("/agents/agent/root/sub/child-agent/leaf"))
+    await wait_until.drain()
+
+    frames = list(map(json.loads, socket.sent))
+    assert [frame["type"] for frame in frames[:3]] == [
+        "cf_agent_identity",
+        "cf_agent_state",
+        "cf_agent_mcp_servers",
+    ]
+    assert [frame for frame in frames if frame.get("type") == "cf_agent_state"] == [
+        {"type": "cf_agent_state", "state": {"started": True}}
+    ]
+    assert len(calls) == 2
+    assert calls[0][2] == calls[1][2]
+    assert len(calls[0][2]) == 1
+
+
+@pytest.mark.asyncio
 async def test_child_connection_tags_are_canonical_and_persist_on_root(monkeypatch):
     class TaggedChild(Agent):
         def __init__(self, ctx, env):
@@ -126,6 +331,10 @@ async def test_child_connection_tags_are_canonical_and_persist_on_root(monkeypat
     assert attachment["target"]["url"].endswith(
         "/agents/agent/root/sub/child-agent/leaf?_pk=child-connection"
     )
+    assert attachment["target"]["path"] == [
+        {"className": "Agent", "name": "test-agent"},
+        {"className": "ChildAgent", "name": "leaf"},
+    ]
 
 
 @pytest.mark.asyncio
@@ -245,7 +454,7 @@ async def test_nested_relay_runs_each_gate_once(monkeypatch):
         GrandChild,
         name="cf-agents:v2:deep:0123456789abcdef",
     )
-    root.ctx.exports = {"ChildAgent": object()}
+    root.ctx.exports = {"ChildAgent": object(), "GrandChild": object()}
     child.ctx.exports = {"GrandChild": object()}
 
     async def root_resolve(class_name, name):
@@ -364,6 +573,14 @@ async def test_chat_turn_is_buffered_and_delivered_from_child(monkeypatch):
         name="cf-agents:v2:chat:0123456789abcdef",
     )
     root.ctx.exports = {"ChildChat": object()}
+    await root._ensure_initialized()
+    root._ensure_sub_agent_registry()
+    root.sql(
+        "INSERT INTO cf_agents_sub_agents (class, name, created_at) "
+        "VALUES ('ChildChat', 'chat', 1)"
+    )
+    child._root_agent_stub = lambda: root
+    await child._cf_init_as_facet("chat", json.dumps(root.self_path))
 
     async def resolve(class_name, name):
         assert (class_name, name) == ("ChildChat", "chat")
